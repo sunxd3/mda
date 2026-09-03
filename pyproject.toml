@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "model-discovery-agent"
+version = "0.1.0"
+description = "A paper-faithful implementation of the Model Discovery Agent and SMC^3"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+llm = ["openai>=1.100"]
+neuron = [
+    "neuronbench @ git+https://github.com/murphyk/neuronbench.git@c354622458c460b419cab821d482c879f0578377",
+]
+baselines = ["neurobench>=2.3.0"]
+dev = [
+    "pytest>=8.0",
+    "model-discovery-agent[llm,neuron]",
+]
+
+[project.scripts]
+mda-toy = "mda.benchmarks.toy:main"
+mda-neuron-baseline = "mda.benchmarks.neuron:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+    "live: calls a paid external API (disabled unless RUN_LIVE_OPENAI=1)",
+    "slow: takes more than a few seconds",
+]

@@ -1,0 +1,8 @@
+.venv/
+.venv-neurobench/
+.pytest_cache/
+__pycache__/
+*.egg-info/
+build/
+dist/
+.amp/portals/*

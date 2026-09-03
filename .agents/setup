@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+echo "[setup] creating the Python environment"
+python3 -m venv .venv
+
+echo "[setup] installing MDA, development tools, Luna client, and NeuronBench"
+.venv/bin/python -m pip install --disable-pip-version-check -e '.[dev]'
+
+echo "[setup] checking source imports"
+.venv/bin/python -m compileall -q src
+
+echo "[setup] complete"
