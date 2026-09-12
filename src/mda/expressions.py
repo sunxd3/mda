@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import json
 import keyword
 from collections.abc import Mapping, Sequence
 from typing import Any
@@ -127,19 +128,81 @@ class SymbolicRegressionProposer:
         observations = "\n".join(
             f"  {datum.action!r} -> {np.asarray(datum.observation).tolist()}" for datum in dataset
         ) or "  (none)"
-        tried = "\n".join(
-            f"  {report['structure'] or report['name']}: median relative residual "
-            f"{report['median_relative_residual']:.5g}"
-            for report in residuals
-        ) or "  (none)"
+        tried = json.dumps(list(residuals))
+        structures = json.dumps([
+            {
+                "name": model.name,
+                "structure": model.structure,
+                "uniform_parameter_priors": {
+                    name: [float(low), float(high)]
+                    for name, low, high in zip(
+                        model.prior.names, model.prior.lower, model.prior.upper, strict=True
+                    )
+                },
+            }
+            for model in current_models
+        ])
+        correlations = []
+        for report in residuals:
+            signed = report.get("signed_per_experiment")
+            if not isinstance(signed, Sequence) or isinstance(signed, (str, bytes)):
+                continue
+            try:
+                residual_vector = np.asarray(signed, dtype=float)
+            except (TypeError, ValueError):
+                continue
+            if residual_vector.shape != (len(dataset),) or len(dataset) < 2:
+                continue
+            by_input = {}
+            for variable in self.variable_names:
+                values = []
+                try:
+                    for datum in dataset:
+                        if isinstance(datum.action, Mapping):
+                            value = datum.action[variable]
+                        elif len(self.variable_names) == 1:
+                            value = datum.action
+                        else:
+                            raise ValueError
+                        scalar = np.asarray(value, dtype=float)
+                        if scalar.ndim != 0:
+                            raise ValueError
+                        values.append(float(scalar))
+                except (KeyError, TypeError, ValueError):
+                    continue
+                input_vector = np.asarray(values)
+                if (
+                    np.all(np.isfinite(input_vector))
+                    and np.all(np.isfinite(residual_vector))
+                    and np.ptp(input_vector) > 0
+                    and np.ptp(residual_vector) > 0
+                ):
+                    correlation = float(np.corrcoef(input_vector, residual_vector)[0, 1])
+                    if np.isfinite(correlation):
+                        by_input[variable] = correlation
+            if by_input:
+                correlations.append({
+                    "structure": report.get("structure"),
+                    "input_signed_residual_correlations": by_input,
+                })
+        correlation_context = json.dumps(correlations)
         variables = ", ".join(self.variable_names)
         prompt = f"""{context}
 
 Observed experiments (inputs -> output):
 {observations}
 
+Current model structures and uniform parameter priors:
+{structures}
+
 Forms already tried and their residuals (do not repeat them):
 {tried}
+The per_experiment residuals follow the experiment order above. Use their variation
+across inputs to identify where each structure fails.
+
+Pearson correlations between numeric scalar inputs and signed residuals, linked to
+the corresponding model structure (undefined correlations are omitted):
+{correlation_context}
 
 Propose {count} distinct, parsimonious closed-form hypotheses for the mean output.
 Each expr must be a Python expression using only variables {variables}, declared

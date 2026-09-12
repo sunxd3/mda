@@ -47,6 +47,8 @@ class ParameterPosterior:
     log_evidence: float
     temperatures: tuple[float, ...]
     acceptance_rate: float
+    ess_before_resampling: tuple[float, ...] = ()
+    last_rung_forced_below_target: bool = False
 
     @property
     def map_index(self) -> int:
@@ -113,6 +115,9 @@ def parameter_posterior(
 
     Proposals outside the uniform-prior support are rejected rather than clipped;
     this preserves the symmetric random-walk acceptance ratio printed in Algorithm 5.
+    If ``max_temperatures`` is reached, the final rung always advances fully to
+    beta=1 rather than returning a silently partial posterior.  The diagnostics
+    report when that forced step falls below the requested ESS target.
     """
     count = config.parameter_particles
     particles = model.prior.sample(rng, count)
@@ -131,6 +136,8 @@ def parameter_posterior(
     log_evidence = 0.0
     beta = 0.0
     temperatures = [beta]
+    ess_before_resampling = []
+    last_rung_forced_below_target = False
     accepted = attempted = 0
 
     for rung in range(config.max_temperatures):
@@ -153,6 +160,12 @@ def parameter_posterior(
             break
         log_evidence += increment
         weights, _ = normalize_log_weights(unnormalized)
+        rung_ess = effective_sample_size(weights)
+        ess_before_resampling.append(rung_ess)
+        if rung == config.max_temperatures - 1:
+            last_rung_forced_below_target = (
+                rung_ess < config.target_ess_fraction * count
+            )
         beta = min(1.0, beta + step)
         temperatures.append(beta)
 
@@ -199,4 +212,6 @@ def parameter_posterior(
         log_evidence=log_evidence,
         temperatures=tuple(temperatures),
         acceptance_rate=accepted / attempted if attempted else 0.0,
+        ess_before_resampling=tuple(ess_before_resampling),
+        last_rung_forced_below_target=last_rung_forced_below_target,
     )

@@ -1,11 +1,21 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from mda.agent import AgentConfig, ModelDiscoveryAgent
 from mda.likelihoods import DeterministicGaussianLikelihood
 from mda.smc import SMCConfig
 from mda.types import CandidateModel, Datum, UniformPrior
+
+
+def fixed_model(name, predict):
+    return CandidateModel(
+        name,
+        UniformPrior((), np.asarray([]), np.asarray([])),
+        lambda theta, x: np.asarray(predict(x)),
+        structure=name,
+    )
 
 
 def constant_model():
@@ -98,3 +108,161 @@ def test_duplicate_proposal_does_not_consume_expansion_budget():
     agent.update_state(1.0, np.asarray(2.0))
     assert agent.expansion_count == 0
     assert len(agent.models) == 1
+
+
+def test_zero_evidence_model_is_excluded_from_design_and_bma():
+    agent = ModelDiscoveryAgent(
+        context="toy",
+        initial_data=[Datum(0.0, np.asarray(1.0))],
+        initial_models=[fixed_model("good", lambda x: 1.0), fixed_model("bad", lambda x: np.nan)],
+        likelihood=DeterministicGaussianLikelihood(1.0),
+        actions=[0.0, 1.0],
+        observation_covariance=1.0,
+        config=AgentConfig(smc=SMCConfig(parameter_particles=1, rejuvenation_steps=0)),
+    )
+
+    assert agent.belief.model_weights.tolist() == [1.0]
+    assert [model.name for model in agent.models] == ["good"]
+    assert agent.design() == 1.0
+    assert agent.last_design_scores.tolist() == [0.0]
+    assert float(agent.predict(1.0, "bma")) == 1.0
+
+
+def test_post_expansion_check_respects_backtest_flag():
+    class ConstantProposer:
+        def __init__(self):
+            self.calls = 0
+
+        def propose(self, **kwargs):
+            self.calls += 1
+            return [fixed_model(f"proposal-{self.calls}", lambda x: 1.0)]
+
+    def run(backtest):
+        proposer = ConstantProposer()
+        agent = ModelDiscoveryAgent(
+            context="toy",
+            initial_data=[Datum(x, np.asarray(1.0)) for x in range(3)],
+            initial_models=[fixed_model("current", lambda x: 2.0 if x in range(3) else 1.0)],
+            proposer=proposer,
+            likelihood=DeterministicGaussianLikelihood(1.0),
+            actions=[0, 1, 2, 3],
+            observation_covariance=1.0,
+            config=AgentConfig(
+                model_cap=4,
+                new_models_per_expansion=1,
+                model_search_rounds=2,
+                expansion_cap=4,
+                error_threshold=0.1,
+                occam_penalty=0.0,
+                backtest=backtest,
+                smc=SMCConfig(parameter_particles=1, rejuvenation_steps=0),
+            ),
+        )
+        error = agent.update_state(3, np.asarray(2.0))
+        return agent, proposer, error
+
+    fresh_only, fresh_proposer, fresh_error = run(False)
+    historical, historical_proposer, historical_error = run(True)
+
+    assert fresh_error == 0.5
+    assert historical_error == 1.0
+    assert fresh_proposer.calls == fresh_only.expansion_count == 2
+    assert historical_proposer.calls == historical.expansion_count == 1
+    assert abs(2.0 - float(fresh_only.predict(3))) / 2.0 == 0.5
+
+
+def test_optimizer_uses_agent_score_and_budget_context():
+    class Proposer:
+        def __init__(self):
+            self.contexts = []
+
+        def propose(self, **kwargs):
+            self.contexts.append(kwargs["context"])
+            if len(self.contexts) == 1:
+                return [fixed_model("left", lambda x: -x), fixed_model("right", lambda x: x)]
+            return [fixed_model("new", lambda x: 3.0)]
+
+    def optimize(score, rng):
+        assert score(0.0) == -np.inf  # seed experiment excluded
+        assert score(1.25) == pytest.approx(1.25**2)
+        assert score(2.75) == pytest.approx(2.75**2)
+        return 2.75
+
+    proposer = Proposer()
+    agent = ModelDiscoveryAgent(
+        context="toy", initial_data=[Datum(0.0, np.asarray(0.0))], initial_models=[],
+        proposer=proposer, likelihood=DeterministicGaussianLikelihood(1.0),
+        actions=[], optimizer=optimize, experiment_budget=1, observation_covariance=1.0,
+        config=AgentConfig(backtest=False, model_search_rounds=1,
+                           smc=SMCConfig(parameter_particles=1, rejuvenation_steps=0)),
+    )
+    assert agent.design() == 2.75
+    assert len(agent.last_design_scores) == 3  # returned action is not evaluated twice
+    agent.update_state(2.75, np.asarray(3.0))
+    assert "budget remaining: 1" in proposer.contexts[0]
+    assert "budget remaining: 0" in proposer.contexts[1]
+    assert "Current phase: explore" in proposer.contexts[1]
+    with pytest.raises(ValueError, match="budget is exhausted"):
+        agent.design()
+
+
+def test_continuous_cmaes_is_wired_to_agent():
+    from mda.optimizers import CMAESOptimizer
+
+    bump = lambda x: np.exp(-((x[0] - 0.7)**2 + 2 * (x[1] + 0.4)**2))
+    agent = ModelDiscoveryAgent(
+        context="continuous toy", initial_data=[],
+        initial_models=[fixed_model("zero", lambda x: 0.0), fixed_model("bump", bump)],
+        likelihood=DeterministicGaussianLikelihood(1.0), actions=[], observation_covariance=1.0,
+        optimizer=CMAESOptimizer([-2, -3], [3, 1], max_evaluations=120),
+        config=AgentConfig(smc=SMCConfig(parameter_particles=1, rejuvenation_steps=0)),
+    )
+    assert np.allclose(agent.design(), [0.7, -0.4], atol=0.1)
+    assert len(agent.last_design_scores) <= 120
+
+
+def test_adaptive_pool_requires_both_gates_and_reopens_on_fresh_failure():
+    class Proposer:
+        def propose(self, **kwargs):
+            return [fixed_model("new", lambda x: 3.0)]
+
+    def make(initial, confidence=0.9):
+        return ModelDiscoveryAgent(
+            context="pool", initial_data=[Datum(0.0, np.asarray(initial))],
+            initial_models=[fixed_model("one", lambda x: 1.0), fixed_model("two", lambda x: 2.0),
+                            fixed_model("four", lambda x: 4.0)],
+            proposer=Proposer(), likelihood=DeterministicGaussianLikelihood(0.4),
+            actions=[1.0], observation_covariance=0.16,
+            config=AgentConfig(model_cap=3, minimum_model_cap=2, shrink_confidence=confidence,
+                               backtest=False, model_search_rounds=1, error_threshold=0.1,
+                               smc=SMCConfig(parameter_particles=1, rejuvenation_steps=0)),
+        )
+
+    confident = make(1.0)
+    assert confident.active_model_cap == 2
+    assert len(confident.models) == 2
+    assert confident.belief.discarded_mass > 0
+    # Confident but poor fit must not shrink; nor may good fit without confidence.
+    assert make(10.0).active_model_cap == 3
+    assert make(1.0, confidence=0.99).active_model_cap == 3
+    confident.update_state(1.0, np.asarray(3.0))
+    assert confident.active_model_cap == 3
+    assert len(confident.models) == 3  # expansion used reopened cap before the refit
+
+
+def test_task_design_has_separate_target_noise_units():
+    from dataclasses import replace
+
+    models = [
+        replace(fixed_model(str(sign), lambda x: np.zeros(20)),
+                predict_target=lambda theta, x, sign=sign: np.asarray(sign * x))
+        for sign in (-1, 1)
+    ]
+    agent = ModelDiscoveryAgent(
+        context="features differ from trace", initial_data=[], initial_models=models,
+        likelihood=DeterministicGaussianLikelihood(1.0), actions=[1.0, 2.0],
+        observation_covariance=np.ones(20), task_noise_covariance=2.0, query_actions=[3.0],
+        config=AgentConfig(design_flavour="task", smc=SMCConfig(parameter_particles=1)),
+    )
+    assert agent.design() == 2.0
+    assert agent.last_design_scores.tolist() == pytest.approx([1.5, 3.0])

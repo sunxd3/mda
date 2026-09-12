@@ -33,8 +33,29 @@ def _covariance_matrix(covariance: float | np.ndarray, dimension: int) -> np.nda
     return matrix
 
 
-def _quadratic(value: np.ndarray, covariance: np.ndarray) -> float:
-    return float(value @ np.linalg.solve(covariance, value))
+def _diagonal_variances(covariance: float | np.ndarray, dimension: int) -> np.ndarray:
+    values = np.asarray(covariance, dtype=float)
+    if values.ndim == 2:
+        if values.shape != (dimension, dimension) or np.any(values != np.diag(np.diag(values))):
+            raise ValueError("coordinatewise task VoI requires diagonal covariances")
+        values = np.diag(values)
+    if values.ndim == 0:
+        values = np.full(dimension, float(values))
+    if values.shape != (dimension,) or np.any(~np.isfinite(values)) or np.any(values <= 0):
+        raise ValueError("variances must be finite, positive, and match the prediction dimension")
+    return values
+
+
+def _weighted_disagreement(values, weights, covariance) -> float:
+    centered = values - weighted_mean(values, weights)
+    if np.asarray(covariance).ndim < 2:
+        # Do not allocate a dense time-by-time matrix for independent trace noise.
+        variances = _diagonal_variances(covariance, values.shape[1])
+        squared = np.sum(centered**2 / variances, axis=1)
+    else:
+        matrix = _covariance_matrix(covariance, values.shape[1])
+        squared = np.sum(centered * np.linalg.solve(matrix, centered.T).T, axis=1)
+    return float(np.asarray(weights) @ squared)
 
 
 def model_eig(
@@ -45,7 +66,7 @@ def model_eig(
     """Paper Eq. 34: between-structure predictive disagreement.
 
     This is the trace surrogate used by the experiments, not the log-determinant
-    moment-matched MI of Eq. 31. The two are equivalent only for scalar outcomes.
+    moment-matched MI of Eq. 31. Their scalar rankings agree, not their values.
     """
     model_means = []
     for fit in belief.fits:
@@ -54,12 +75,7 @@ def model_eig(
         )
         model_means.append(weighted_mean(predictions, fit.parameters.weights))
     means = np.stack(model_means)
-    overall = weighted_mean(means, belief.model_weights)
-    covariance = _covariance_matrix(observation_covariance, len(overall))
-    return sum(
-        float(weight) * _quadratic(mean - overall, covariance)
-        for weight, mean in zip(belief.model_weights, means, strict=True)
-    )
+    return _weighted_disagreement(means, belief.model_weights, observation_covariance)
 
 
 def joint_eig(
@@ -75,12 +91,7 @@ def joint_eig(
         weights.append(weight)
     values = np.stack(predictions)
     weights_array = np.asarray(weights)
-    mean = weighted_mean(values, weights_array)
-    covariance = _covariance_matrix(observation_covariance, len(mean))
-    return sum(
-        float(weight) * _quadratic(value - mean, covariance)
-        for weight, value in zip(weights_array, values, strict=True)
-    )
+    return _weighted_disagreement(values, weights_array, observation_covariance)
 
 
 def task_value_of_information(
@@ -90,11 +101,49 @@ def task_value_of_information(
     observation_covariance: float | np.ndarray,
     target_covariance: float | np.ndarray | None = None,
 ) -> float:
-    """Squared-loss task VoI (paper Eq. 43), generalized to vector targets.
+    """Eq. 43: target-to-target covariance, summed coordinatewise after whitening.
+
+    Here ``observation_covariance`` is noise in *target* space, not raw trace
+    space. It and the optional loss scale ``target_covariance`` must be scalar
+    or diagonal. By default the noise variances also whiten the loss, as in the
+    prose after Eq. 45. Query targets must have the same coordinates as the
+    target at the proposed action. No cross-coordinate conditioning is used.
+    """
+    particles = list(belief.iter_parameter_particles())
+    weights = np.asarray([weight for _, _, weight in particles])
+    observed = np.stack(
+        [_flat(model.target_prediction(theta, action)) for model, theta, _ in particles]
+    )
+    noise = _diagonal_variances(observation_covariance, observed.shape[1])
+    scale = noise if target_covariance is None else _diagonal_variances(
+        target_covariance, observed.shape[1]
+    )
+    centered = observed - weighted_mean(observed, weights)
+    variance = weighted_mean(centered**2, weights)
+    values = []
+    for query in query_actions:
+        targets = np.stack(
+            [_flat(model.target_prediction(theta, query)) for model, theta, _ in particles]
+        )
+        if targets.shape != observed.shape:
+            raise ValueError("query and design targets must have the same coordinates")
+        cross = weighted_mean((targets - weighted_mean(targets, weights)) * centered, weights)
+        values.append(float(np.sum(cross**2 / (variance + noise) / scale)))
+    return float(np.mean(values)) if values else 0.0
+
+
+def full_observation_task_value_of_information(
+    action: Any,
+    query_actions: Sequence[Any],
+    belief: BeliefState,
+    observation_covariance: float | np.ndarray,
+    target_covariance: float | np.ndarray | None = None,
+) -> float:
+    """Alternative Gaussian conditioning on raw observations, not literal Eq. 43.
 
     For each query this computes the linear-Gaussian expected reduction in target
     variance, tr(C_qy V_y^-1 C_yq). A supplied target covariance whitens target
-    coordinates, matching the paper's component-standardized NeuronBench score.
+    coordinates. This dense calculation includes cross-coordinate information.
     """
     particles = list(belief.iter_parameter_particles())
     weights = np.asarray([weight for _, _, weight in particles], dtype=float)
@@ -120,17 +169,15 @@ def task_value_of_information(
     return float(np.mean(values)) if values else 0.0
 
 
-def choose_design(
-    actions: Sequence[Any],
+def value_of_information(
+    action: Any,
     belief: BeliefState,
     *,
     flavour: str,
     observation_covariance: float | np.ndarray,
     query_actions: Sequence[Any] = (),
     target_covariance: float | np.ndarray | None = None,
-) -> tuple[Any, np.ndarray]:
-    if not actions:
-        raise ValueError("the design space is empty")
+) -> float:
     scorers = {
         "model": lambda action: model_eig(action, belief, observation_covariance),
         "joint": lambda action: joint_eig(action, belief, observation_covariance),
@@ -141,10 +188,25 @@ def choose_design(
             observation_covariance,
             target_covariance,
         ),
+        "task_full_observation": lambda action: full_observation_task_value_of_information(
+            action, query_actions, belief, observation_covariance, target_covariance,
+        ),
     }
     if flavour not in scorers:
         raise ValueError(f"unknown design flavour {flavour!r}")
-    scores = np.asarray([scorers[flavour](action) for action in actions], dtype=float)
+    return scorers[flavour](action)
+
+
+def choose_design(
+    actions: Sequence[Any],
+    belief: BeliefState,
+    **score_options,
+) -> tuple[Any, np.ndarray]:
+    if len(actions) == 0:
+        raise ValueError("the design space is empty")
+    scores = np.asarray([
+        value_of_information(action, belief, **score_options) for action in actions
+    ], dtype=float)
     scores[~np.isfinite(scores)] = -np.inf
     if not np.any(np.isfinite(scores)):
         raise ValueError("every candidate design has a non-finite VoI")

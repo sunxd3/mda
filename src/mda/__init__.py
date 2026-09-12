@@ -1,11 +1,15 @@
 """Model Discovery Agent: LLM proposals, SMC³ inference, and Bayesian design."""
 
-from .acquisition import joint_eig, model_eig, task_value_of_information
+from .acquisition import (
+    full_observation_task_value_of_information,
+    joint_eig, model_eig, task_value_of_information,
+)
 from .agent import AgentConfig, ModelDiscoveryAgent
 from .expressions import SymbolicRegressionProposer, compile_expression
 from .likelihoods import BootstrapParticleFilter, DeterministicGaussianLikelihood
 from .neuronbench_adapter import NeuronBenchEnvironment, NeuronBenchProposer, NeuronHypothesis
 from .openai_client import OpenAIJSONClient
+from .optimizers import CMAESOptimizer
 from .posterior import BeliefState, ModelFit, fit_model_posterior
 from .proposer import ModelProposer
 from .smc import SMCConfig, parameter_posterior
@@ -15,6 +19,7 @@ __all__ = [
     "AgentConfig",
     "BeliefState",
     "BootstrapParticleFilter",
+    "CMAESOptimizer",
     "CandidateModel",
     "Datum",
     "DeterministicGaussianLikelihood",
@@ -31,6 +36,7 @@ __all__ = [
     "UniformPrior",
     "compile_expression",
     "fit_model_posterior",
+    "full_observation_task_value_of_information",
     "joint_eig",
     "model_eig",
     "parameter_posterior",

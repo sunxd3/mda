@@ -15,13 +15,14 @@ dependencies = [
 
 [project.optional-dependencies]
 llm = ["openai>=1.100"]
+design = ["cma>=4.0"]
 neuron = [
     "neuronbench @ git+https://github.com/murphyk/neuronbench.git@c354622458c460b419cab821d482c879f0578377",
 ]
 baselines = ["neurobench>=2.3.0"]
 dev = [
     "pytest>=8.0",
-    "model-discovery-agent[llm,neuron]",
+    "model-discovery-agent[design,llm,neuron]",
 ]
 
 [project.scripts]

@@ -8,7 +8,7 @@ from typing import Any
 
 import numpy as np
 
-from .acquisition import choose_design
+from .acquisition import choose_design, value_of_information
 from .checks import TargetFn, identity_target, in_sample_check, predictive_check, residual_report
 from .posterior import BeliefState, fit_model_posterior
 from .proposer import ModelProposer
@@ -29,6 +29,8 @@ class AgentConfig:
     design_flavour: str = "model"
     repeat_designs: bool = False
     smc: SMCConfig = field(default_factory=SMCConfig)
+    minimum_model_cap: int | None = None
+    shrink_confidence: float = 0.95
 
     def __post_init__(self) -> None:
         if self.model_cap < 1 or self.new_models_per_expansion < 1:
@@ -37,8 +39,12 @@ class AgentConfig:
             raise ValueError("search and expansion limits cannot be negative")
         if self.error_threshold < 0 or self.occam_penalty < 0:
             raise ValueError("error threshold and Occam penalty cannot be negative")
-        if self.design_flavour not in {"model", "joint", "task"}:
-            raise ValueError("design_flavour must be model, joint, or task")
+        if self.design_flavour not in {"model", "joint", "task", "task_full_observation"}:
+            raise ValueError("unknown design_flavour")
+        if self.minimum_model_cap is not None and not 1 <= self.minimum_model_cap <= self.model_cap:
+            raise ValueError("minimum_model_cap must be between 1 and model_cap")
+        if not 0 < self.shrink_confidence <= 1:
+            raise ValueError("shrink_confidence must be in (0, 1]")
 
 
 class ModelDiscoveryAgent:
@@ -62,6 +68,9 @@ class ModelDiscoveryAgent:
         target: TargetFn = identity_target,
         query_actions: Sequence[Any] = (),
         target_covariance: float | np.ndarray | None = None,
+        task_noise_covariance: float | np.ndarray | None = None,
+        optimizer: Callable[[Callable[[Any], float], np.random.Generator], Any] | None = None,
+        experiment_budget: int | None = None,
         action_key: Callable[[Any], str] = repr,
         seed: int = 0,
     ) -> None:
@@ -75,6 +84,13 @@ class ModelDiscoveryAgent:
         self.target = target
         self.query_actions = list(query_actions)
         self.target_covariance = target_covariance
+        self.task_noise_covariance = task_noise_covariance
+        self.optimizer = optimizer
+        if experiment_budget is not None and experiment_budget < 0:
+            raise ValueError("experiment_budget cannot be negative")
+        self.experiment_budget = experiment_budget
+        self.experiments_run = 0
+        self.active_model_cap = config.model_cap
         self.action_key = action_key
         self.rng = np.random.default_rng(seed)
         self.expansion_count = 0
@@ -87,7 +103,7 @@ class ModelDiscoveryAgent:
             if proposer is None:
                 raise ValueError("initial_models cannot be empty without a proposer")
             models = proposer.propose(
-                context=context,
+                context=self._proposal_context(),
                 dataset=self.dataset,
                 current_models=(),
                 residuals=(),
@@ -96,6 +112,7 @@ class ModelDiscoveryAgent:
         if not models:
             raise ValueError("the proposer returned no valid initial models")
         self.belief = self._fit(models)
+        self._adapt_pool()
 
     @property
     def models(self) -> tuple[CandidateModel, ...]:
@@ -107,10 +124,38 @@ class ModelDiscoveryAgent:
             models,
             self.likelihood,
             self.config.smc,
-            model_cap=self.config.model_cap,
+            model_cap=self.active_model_cap,
             occam_penalty=self.config.occam_penalty,
             rng=self.rng,
         )
+
+    def _proposal_context(self) -> str:
+        status = "Current phase: explore (the pool is being initialized or has failed its check)."
+        if self.experiment_budget is not None:
+            status += f"\nExperiment budget remaining: {max(0, self.experiment_budget - self.experiments_run)}."
+        return f"{self.context}\n\n{status}"
+
+    def _adapt_pool(self) -> None:
+        """Optional Appendix B.3 gates; confidence cutoff is a local choice."""
+        if self.config.minimum_model_cap is None:
+            return
+        error = in_sample_check(
+            self.belief, self.dataset, target=self.target, floor=self.config.predictive_floor,
+        )
+        confident = self.belief.model_weights[self.belief.map_index] >= self.config.shrink_confidence
+        self.active_model_cap = (
+            self.config.minimum_model_cap
+            if confident and error <= self.config.error_threshold else self.config.model_cap
+        )
+        if len(self.belief.fits) > self.active_model_cap:
+            order = np.argsort(-self.belief.model_weights, kind="stable")[:self.active_model_cap]
+            weights = self.belief.model_weights[order]
+            retained = float(weights.sum())
+            self.belief = BeliefState(
+                tuple(self.belief.fits[index] for index in order), weights / retained,
+                1 - (1 - self.belief.discarded_mass) * retained,
+                self.belief.log_mixture_evidence,
+            )
 
     def available_actions(self) -> list[Any]:
         if self.config.repeat_designs:
@@ -118,14 +163,38 @@ class ModelDiscoveryAgent:
         return [action for action in self.actions if self.action_key(action) not in self.used_action_keys]
 
     def design(self) -> Any:
-        action, scores = choose_design(
-            self.available_actions(),
-            self.belief,
+        if self.experiment_budget is not None and self.experiments_run >= self.experiment_budget:
+            raise ValueError("the experiment budget is exhausted")
+        options = dict(
             flavour=self.config.design_flavour,
-            observation_covariance=self.observation_covariance,
+            observation_covariance=(
+                self.task_noise_covariance
+                if self.config.design_flavour == "task" and self.task_noise_covariance is not None
+                else self.observation_covariance
+            ),
             query_actions=self.query_actions,
             target_covariance=self.target_covariance,
         )
+        if self.optimizer is not None:
+            scores = []
+            evaluated = {}
+
+            def score(action):
+                key = self.action_key(action)
+                value = (
+                    -np.inf if not self.config.repeat_designs and key in self.used_action_keys
+                    else value_of_information(action, self.belief, **options)
+                )
+                scores.append(value)
+                evaluated[key] = value
+                return value
+
+            action = self.optimizer(score, self.rng)
+            if not np.isfinite(evaluated.get(self.action_key(action), -np.inf)):
+                raise ValueError("optimizer must return an evaluated, finite, non-repeated design")
+            scores = np.asarray(scores)
+        else:
+            action, scores = choose_design(self.available_actions(), self.belief, **options)
         self.last_design_scores = scores
         return action
 
@@ -148,6 +217,9 @@ class ModelDiscoveryAgent:
         self.last_predictive_error = error
         self.dataset.append(fresh)
         self.used_action_keys.add(self.action_key(action))
+        self.experiments_run += 1
+        if error > self.config.error_threshold:
+            self.active_model_cap = self.config.model_cap
 
         expanded = False
         check_error = error
@@ -166,7 +238,7 @@ class ModelDiscoveryAgent:
                 for fit in self.belief.fits
             ]
             proposals = self.proposer.propose(
-                context=self.context,
+                context=self._proposal_context(),
                 dataset=self.dataset,
                 current_models=self.models,
                 residuals=reports,
@@ -185,16 +257,23 @@ class ModelDiscoveryAgent:
             expanded = True
             check_error = in_sample_check(
                 self.belief,
-                self.dataset,
+                self.dataset if self.config.backtest else [fresh],
                 target=self.target,
                 floor=self.config.predictive_floor,
             )
 
         if not expanded:
             self.belief = self._fit(self.models)
+        self._adapt_pool()
         return error
 
     def get_model(self) -> CandidateModel:
+        """Current-data Occam-MAP, not a winner selected using held-out truth.
+
+        Algorithm 2's 'over any round' rule is unspecified; historical posterior
+        masses have different normalizers and are not comparable. Best-so-far
+        held-out curves belong in the evaluator, never in this selection step.
+        """
         return self.belief.map_fit.model
 
     def predict(self, action: Any, flavour: str = "map") -> np.ndarray:

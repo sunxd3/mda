@@ -81,10 +81,26 @@ def residual_report(
     target: TargetFn = identity_target,
     floor: float | np.ndarray = 1e-6,
 ) -> dict[str, Any]:
-    errors = [fit_residual(fit, datum, target, floor) for datum in dataset]
+    errors = []
+    signed_errors = []
+    theta = fit.parameters.map_parameters
+    for datum in dataset:
+        observed = np.asarray(target(datum.observation, datum.action), dtype=float).reshape(-1)
+        predicted = np.asarray(
+            fit.model.target_prediction(theta, datum.action), dtype=float
+        ).reshape(-1)
+        if observed.shape != predicted.shape:
+            raise ValueError("observed and predicted targets have different shapes")
+        denominator = np.maximum(np.abs(observed), np.asarray(floor, dtype=float))
+        if np.any(denominator <= 0) or np.any(~np.isfinite(denominator)):
+            raise ValueError("predictive-check floors must be finite and positive")
+        relative = (observed - predicted) / denominator
+        errors.append(float(np.median(np.abs(relative))))
+        signed_errors.append(float(np.median(relative)))
     return {
         "name": fit.model.name,
         "structure": fit.model.structure,
         "median_relative_residual": float(np.median(errors)) if errors else 0.0,
         "per_experiment": errors,
+        "signed_per_experiment": signed_errors,
     }

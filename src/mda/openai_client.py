@@ -2,13 +2,29 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import tempfile
+from pathlib import Path
 from typing import Any
 
 
 class OpenAIJSONClient:
-    def __init__(self, model: str = "gpt-5.6-luna", api_key: str | None = None) -> None:
+    """Responses API client with optional local caching.
+
+    When ``cache_dir`` is set, response text is persisted under request hashes
+    in that directory. Callers are responsible for the privacy and
+    lifecycle of that data.
+    """
+
+    def __init__(
+        self,
+        model: str = "gpt-5.6-luna",
+        api_key: str | None = None,
+        *,
+        cache_dir: Path | str | None = None,
+    ) -> None:
         try:
             from openai import OpenAI
         except ImportError as error:
@@ -17,7 +33,53 @@ class OpenAIJSONClient:
         if not key:
             raise RuntimeError("OPENAI_API_KEY is not set")
         self.model = model
+        self.cache_dir = Path(cache_dir) if cache_dir is not None else None
         self._client = OpenAI(api_key=key)
+
+    def _cache_path(self, request: dict[str, Any]) -> Path | None:
+        if self.cache_dir is None:
+            return None
+        canonical = json.dumps(
+            request, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
+        return self.cache_dir / f"{hashlib.sha256(canonical).hexdigest()}.txt"
+
+    @staticmethod
+    def _read_cache(path: Path) -> str | None:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            return None
+        return text if text.strip() else None
+
+    @staticmethod
+    def _write_cache(path: Path, text: str) -> None:
+        temporary: str | None = None
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=path.parent,
+                prefix=f".{path.name}.",
+                delete=False,
+            ) as output:
+                temporary = output.name
+                output.write(text)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary, path)
+            temporary = None
+        except OSError:
+            # Caching is an optimization and must not make a successful API
+            # response fail.
+            pass
+        finally:
+            if temporary is not None:
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
 
     def ask(
         self,
@@ -41,11 +103,19 @@ class OpenAIJSONClient:
             request["reasoning"] = {"effort": "low"}
         else:
             request["temperature"] = temperature
+        cache_path = self._cache_path(request)
+        if cache_path is not None:
+            cached = self._read_cache(cache_path)
+            if cached is not None:
+                return cached
         response = self._client.responses.create(**request)
         if response.status != "completed":
             reason = getattr(response.incomplete_details, "reason", "unknown")
             raise RuntimeError(f"OpenAI response did not complete: {reason}")
-        return response.output_text
+        text = response.output_text
+        if cache_path is not None and isinstance(text, str) and text.strip():
+            self._write_cache(cache_path, text)
+        return text
 
     def ask_json(
         self,
