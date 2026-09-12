@@ -8,9 +8,11 @@ from the paper and uses the authors' released
 [NeuronBench](https://github.com/murphyk/neuronbench) for protocols, deterministic
 HH simulation, and a reference baseline.
 
-This is a reconstruction of the core algorithms, **not a reproduction of the
-paper's reported benchmark results**. The supported parameter prior is a bounded
-independent uniform prior; the NumPyro latent-program backend is not implemented.
+This is an executable reconstruction, **not a reproduction of the paper's
+reported benchmark results**. It includes single-run drivers for all four
+benchmark families, including stochastic NeuronBench, and a NumPyro
+latent-program backend. Missing public experimental inputs and remaining
+comparison-harness limits are listed below; smoke runs are not benchmark scores.
 
 The LLM proposes model structures. Numerical code—not the LLM—fits parameters,
 estimates marginal evidence, maintains the model posterior, checks residuals,
@@ -43,6 +45,13 @@ experiment ◀── maximize VoI ◀── posterior ──▶ MAP / BMA predic
 - A deterministic NeuronBench adapter restoring the fixed two-experiment seed
   set, six-feature prompt, selectable activation/inactivation kinetics, inferred
   slow-Na time constant, and component-normalized query MSE evaluation.
+- A Fox–Lu stochastic candidate with latent-state PF callbacks, 200-rollout
+  expected-feature forecasts, and independent held-out targets.
+- NumPyro continuous scalar/array priors with support transforms and Jacobians;
+  sampler-coordinate inference and physical-coordinate MAP ranking. Discrete,
+  observed, and dimension-changing (e.g. simplex) sites are explicitly rejected.
+- Cached Anthropic Opus proposals, credential-free offline replay, scalar
+  GLM likelihoods, an ICL forecaster, and finite-grid constant-refit recovery tests.
 
 ## Install and run
 
@@ -67,6 +76,70 @@ RUN_LIVE_OPENAI=1 .venv/bin/pytest -q tests/test_openai_live.py
 .venv/bin/mda-neuron-baseline \
   --world ca_rebound --budget 2 --model gpt-5.6-luna
 ```
+
+### Reproduction driver: one explicit run at a time
+
+```bash
+.venv/bin/pip install -e '.[dev,numpyro,physics]'
+
+# PhysicsSchool's pinned wheel omits namespace subpackages. It needs an
+# editable checkout in addition to the physics extra above.
+git clone https://github.com/SampsonML/DiscoverPhysics.git /tmp/DiscoverPhysics
+git -C /tmp/DiscoverPhysics checkout 33b7fa9df96de9c35744efd181ca7e5a8dd60ad5
+.venv/bin/pip install -e /tmp/DiscoverPhysics/PhysicsSchool
+
+# ChemBench is an unpackaged source dependency (NumPy oracle only; no PySR).
+git clone https://github.com/scientific-discovery/LLM-AutoSciLab.git /tmp/LLM-AutoSciLab
+git -C /tmp/LLM-AutoSciLab checkout 9a37255ff5432a7155b6cde8985e9654f2f8f272
+export AUTOSCILAB_SOURCE_ROOT=/tmp/LLM-AutoSciLab
+
+.venv/bin/mda-reproduce boxing --world death --smoke --budget 1 --output /tmp/boxing.json
+.venv/bin/mda-reproduce boxing --world death --agent apprentice --smoke --budget 1 --output /tmp/apprentice.json
+.venv/bin/mda-reproduce physics --world gravity --smoke --budget 1 --output /tmp/physics.json
+.venv/bin/mda-reproduce chemistry --world c0_michaelis_menten --smoke --budget 1 --output /tmp/chemistry.json
+.venv/bin/mda-reproduce neuron --world h_sag --stochastic --smoke --budget 1 --output /tmp/neuron.json
+```
+
+The driver requires exactly one of `--smoke`, `--replay`, or `--live`. Smoke
+uses small numerical budgets and generic, non-truth baselines; it makes no LLM
+calls. Neuron smoke checks feature forecasts but omits expensive held-out
+200-rollout scoring. Replay reads previously captured Anthropic responses and
+fails on cache misses without contacting a provider. Live explicitly authorizes
+paid calls; it defaults to `claude-opus-4-7`, temperature 0.3. `--model` overrides
+the provider model ID. No model availability or live score claim is made here.
+
+Normal runs use Table 2 settings. Specify `--budget` explicitly (the conservative
+CLI default is one experiment, not a paper sweep). `--design` selects model,
+joint, task, or finite-menu random design; `--no-m-open` disables expansion after
+the initial pool. Boxing defaults to BMA prediction; the other domains use MAP.
+Neuron task design requires an explicit `--task-noise-variance` (one or six
+positive feature-space variances), since the paper does not release that
+calibration. It must not silently use raw voltage noise for six different features.
+
+`--agent apprentice` implements the Boxing H.3.2 comparison: one evolving
+model, LLM-selected experiments, and a residual-conditioned refinement on every
+round, fitted by the same SMC. `--icl` adds the data-only forecasting baseline
+after every round (replay/live only). `--recovery` adds ChemBench constant-refit
+recovery scoring; recovery parameters never replace the agent's fitted parameters.
+The physics driver also accepts `circle`, `ether`, and `hubble`. These extensions
+use documented local launch menus because the exact paper menus are unreleased.
+
+IRT, location, and survival generate NumPyro Python. Non-smoke runs require
+`--allow-code-execution`: **this executes arbitrary generated Python with process
+privileges, not in a security sandbox**. Use only a suitably isolated environment
+and trusted/reviewed proposals. The AST symbolic backend does not require this flag.
+
+JSON results contain the request, package versions, effective numerical settings,
+per-round actions, observations, current model/parameters, model weights,
+log-evidences, forced-tempering diagnostics, scores, and a separately labeled
+best-so-far curve. Evaluation does not select models or feed query labels into
+training. Output files are never intentionally overwritten.
+
+`mda.benchmarks.icl.make_icl_predictor` provides a model-free baseline using only
+observed action-target pairs and query inputs. `mda.benchmarks.recovery.evaluate_recovery`
+refits a trusted symbolic candidate's constants on a separate noise-free grid
+and tests held-out RMSLE. This is a numerical approximation, not a proof of
+symbolic equality; it does not parse arbitrary source through SymPy.
 
 `gpt-5.6-luna` does not accept `temperature`; the client omits it for GPT-5.6
 models, requests low reasoning effort, and reserves enough output tokens for
@@ -142,7 +215,9 @@ responses by the complete effective request, including the model and schema.
 The key excludes credentials; cached response text may still contain sensitive
 data. Keep the directory private and out of version control. The default is no
 cache. This enables replay of captured calls, not reproduction of the paper's
-unreleased Opus-4.7 responses. Luna remains the default provider/model choice.
+unreleased Opus-4.7 responses. The toy CLI uses Luna; the reproduction driver uses
+Anthropic by default. `AnthropicJSONClient(..., replay_only=True)` fails before
+SDK loading or credential checks on a missing cached response.
 
 Pass `experiment_budget=B` to include the remaining budget in proposal context
 and prevent `design()` after B updates. Proposals are labeled `explore`: the core
@@ -288,19 +363,40 @@ by the paper:
 - it exposes stochastic rollouts, but not the one-step latent transition contract
   needed to fit arbitrary proposed mechanisms with a bootstrap PF.
 
-Therefore this repository does not pretend that the released deterministic
-adapter reproduces the paper's stochastic NeuronBench results. The generic nested
-PF/parameter-SMC/model-posterior path is tested against integrated multi-step
-Gaussian evidence and model probabilities. That controlled test does not
-establish calibration for nonlinear neuron dynamics. A parameterized Fox–Lu
-candidate transition model and stochastic expected-feature predictor are still
-needed for that domain reproduction.
+The stochastic adapter now supplies the missing transition contract and is tested
+against pinned upstream rollouts. PF integration is separately checked against
+analytic multi-step Gaussian evidence. Neither test establishes nonlinear-neuron
+calibration or reproduces the paper's scores. Its observed-feature summaries use
+the stochastic sampling grid, but cannot recover spikes missed between ~4 ms
+samples; expected targets use full simulated traces. Table 2's 200/.5 particle/ESS
+settings are used rather than Table 14's conflicting deterministic 48/.6 settings.
 
-There are no full ForceBench, ChemBench, BoxingGym, or stochastic NeuronBench
-comparison runners here, and no claim of matched paper scores, prompts, seeds,
-or budgets. The neuron CLI is the released pure-LLM baseline, not an MDA benchmark
-battery. Learned summary statistics are future work in v4, not a missing core
-algorithm requirement.
+### What still prevents an exact paper reproduction
+
+- The paper's complete cached Opus outputs, exact prompts/configuration files,
+  validation choices, and ChemBench 36-task manifest are not publicly supplied.
+  The pinned ChemBench registry differs from the paper's stated universe. The
+  driver requires an explicit domain ID; it does not invent a matching subset.
+- ChemBench follows Appendix B.2's Gaussian fit in `log1p(rate)` space with SD
+  .01, whereas the main text describes raw-rate multiplicative noise. Seed-point
+  companion values are documented local defaults. The upstream oracle's noise
+  is input-hashed, not a new independent draw for each run seed.
+- ForceBench covers the six central two-particle worlds plus Circle, Ether,
+  and Hubble. Dark-matter/three-species inference, the larger MIRT/curriculum
+  example, and exact external DP-Agent/AutoSciLab comparison harnesses are not implemented.
+  Thus the main-domain MDA runner is not a complete all-figures reproduction.
+  Ether follows the public simulator's common drift of the anchor and probes,
+  rather than interpreting the appendix's anchor as immovable. Extension
+  background-coefficient bounds [-1,1] and launch templates are local choices.
+- Boxing uses reconstructed equations with private RNGs, not the original PyMC
+  execution or identical RNG draws. IRT and survival use fixed outcomes and
+  Brier loss; the remaining tasks use clean-mean nMSE. Dugongs follows Table 8's
+  Gaussian observation, not upstream's folded output. Generic 24-design/12-query
+  pools are configurable local defaults, not claimed paper evaluation grids.
+- Recovery currently covers chemistry only and lacks SymPy canonicalization;
+  ForceBench functional recovery is not wired into curves. Large benchmark runs, paid
+  proposal calls, statistical score matching, and full comparison plots remain
+  unexecuted. Learned summaries are future work in v4, not a missing algorithm.
 
 ## License
 

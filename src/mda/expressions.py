@@ -14,6 +14,18 @@ from .openai_client import OpenAIJSONClient
 from .types import CandidateModel, Datum, UniformPrior
 
 
+def _scipy_special(name: str):
+    """Return a lazy SciPy special function (SciPy is an optional dependency)."""
+    def call(value):
+        try:
+            from scipy import special
+        except ImportError as error:
+            raise RuntimeError(f"{name} expressions require scipy") from error
+        return getattr(special, name)(value)
+
+    return call
+
+
 _FUNCTIONS = {
     "abs": np.abs,
     "cos": np.cos,
@@ -28,6 +40,9 @@ _FUNCTIONS = {
     "tan": np.tan,
     "tanh": np.tanh,
     "where": np.where,
+    "k0": _scipy_special("k0"),
+    "k1": _scipy_special("k1"),
+    "gamma": _scipy_special("gamma"),
 }
 _ALLOWED_NODES = (
     ast.Expression,
@@ -246,6 +261,7 @@ scientifically plausible uniform-prior bounds. Return JSON only."""
             prompt,
             schema=schema,
             name="model_hypotheses",
+            max_tokens=max(1600, 400 * count),
         )
         models = []
         existing = {model.key for model in current_models}

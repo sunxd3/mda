@@ -6,8 +6,44 @@ import numpy as np
 
 from mda.likelihoods import BootstrapParticleFilter, DeterministicGaussianLikelihood
 from mda.posterior import fit_model_posterior
-from mda.smc import SMCConfig, parameter_posterior
+from mda.smc import ParameterPosterior, SMCConfig, parameter_posterior
 from mda.types import CandidateModel, Datum, StateSpaceModel, UniformPrior
+
+
+def test_map_ranking_uses_physical_prior_not_likelihood_or_jacobian():
+    posterior = ParameterPosterior(
+        particles=np.array([[0.], [1.], [2.]]), weights=np.full(3, 1/3),
+        log_likelihoods=np.array([0., 1., 2.]), log_evidence=0,
+        temperatures=(0., 1.), acceptance_rate=0,
+        log_priors=np.array([0., -10., -20.]),
+        map_log_priors=np.array([0., 5., 0.]),
+    )
+    assert posterior.map_index == 1
+
+
+def test_nonuniform_prior_smc_matches_conjugate_normal_posterior():
+    class NormalPrior:
+        names = ("mean",)
+        dimension = 1
+        proposal_scale_hint = np.ones(1)
+
+        def sample(self, rng, count):
+            return rng.normal(size=(count, 1))
+
+        def logpdf(self, theta):
+            return -.5 * (float(theta[0])**2 + np.log(2*np.pi))
+
+    candidate = CandidateModel("normal", NormalPrior(), lambda t, a: np.asarray(t[0]))
+    posterior = parameter_posterior(
+        [Datum(0, np.asarray(4.))], candidate, DeterministicGaussianLikelihood(2.),
+        SMCConfig(parameter_particles=3000, rejuvenation_steps=3), np.random.default_rng(21),
+    )
+    # Prior variance 1, likelihood variance 4: posterior mean .8, variance .8;
+    # marginal observation is Normal(0,5), with variance rather than SD 5.
+    assert abs(posterior.particles.mean() - .8) < .06
+    assert abs(posterior.particles.var() - .8) < .06
+    assert abs(posterior.log_evidence - (-.5*(16/5 + np.log(10*np.pi)))) < .06
+    assert abs(posterior.map_parameters[0] - .8) < .02
 
 
 def model(name="constant", dimensions=1, prediction=None):

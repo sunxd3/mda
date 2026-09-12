@@ -277,8 +277,9 @@ class NeuronBenchEnvironment:
 class NeuronBenchProposer:
     """Electrophysiology structure proposer based on Appendix H.4.1."""
 
-    def __init__(self, client: OpenAIJSONClient) -> None:
+    def __init__(self, client: OpenAIJSONClient, *, feature_fn=trace_features) -> None:
         self.client = client
+        self.feature_fn = feature_fn
 
     def propose(
         self,
@@ -290,7 +291,7 @@ class NeuronBenchProposer:
         count: int,
     ) -> list[CandidateModel]:
         experiments = "\n".join(
-            f"  - {datum.action[0]} -> {trace_features(datum.observation, datum.action).tolist()}"
+            f"  - {datum.action[0]} -> {self.feature_fn(datum.observation, datum.action).tolist()}"
             for datum in dataset
         )
         tried = json.dumps([

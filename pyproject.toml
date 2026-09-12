@@ -14,7 +14,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-llm = ["openai>=1.100"]
+llm = ["openai>=1.100", "anthropic>=0.79"]
+numpyro = ["numpyro>=0.19", "jax>=0.4.25"]
+physics = [
+    "physchool @ git+https://github.com/SampsonML/DiscoverPhysics.git@33b7fa9df96de9c35744efd181ca7e5a8dd60ad5#subdirectory=PhysicsSchool",
+    "ScienceAgent @ git+https://github.com/SampsonML/DiscoverPhysics.git@33b7fa9df96de9c35744efd181ca7e5a8dd60ad5#subdirectory=ScienceAgent",
+]
 design = ["cma>=4.0"]
 neuron = [
     "neuronbench @ git+https://github.com/murphyk/neuronbench.git@c354622458c460b419cab821d482c879f0578377",
@@ -22,12 +27,13 @@ neuron = [
 baselines = ["neurobench>=2.3.0"]
 dev = [
     "pytest>=8.0",
-    "model-discovery-agent[design,llm,neuron]",
+    "model-discovery-agent[design,llm,neuron,numpyro]",
 ]
 
 [project.scripts]
 mda-toy = "mda.benchmarks.toy:main"
 mda-neuron-baseline = "mda.benchmarks.neuron:main"
+mda-reproduce = "mda.benchmarks.reproduce:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

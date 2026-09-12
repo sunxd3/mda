@@ -49,10 +49,16 @@ class ParameterPosterior:
     acceptance_rate: float
     ess_before_resampling: tuple[float, ...] = ()
     last_rung_forced_below_target: bool = False
+    log_priors: np.ndarray | None = None
+    map_log_priors: np.ndarray | None = None
 
     @property
     def map_index(self) -> int:
-        return int(np.argmax(self.log_likelihoods))
+        scores = self.log_likelihoods
+        ranking_priors = self.map_log_priors if self.map_log_priors is not None else self.log_priors
+        if ranking_priors is not None:
+            scores = scores + ranking_priors
+        return int(np.argmax(scores))
 
     @property
     def map_parameters(self) -> np.ndarray:
@@ -121,6 +127,9 @@ def parameter_posterior(
     """
     count = config.parameter_particles
     particles = model.prior.sample(rng, count)
+    if np.asarray(particles).shape != (count, model.parameter_count):
+        raise ValueError("prior.sample must return shape (count, dimension)")
+    log_priors = np.asarray([model.prior.logpdf(theta) for theta in particles], dtype=float)
     log_likelihoods = _evaluate_likelihoods(dataset, model, particles, likelihood, rng)
     if not np.any(np.isfinite(log_likelihoods)):
         return ParameterPosterior(
@@ -130,6 +139,10 @@ def parameter_posterior(
             log_evidence=-np.inf,
             temperatures=(0.0,),
             acceptance_rate=0.0,
+            log_priors=log_priors,
+            map_log_priors=np.asarray(
+                [model.metadata.get("map_log_prior", model.prior.logpdf)(x) for x in particles]
+            ),
         )
 
     log_weights = np.full(count, -np.log(count))
@@ -172,12 +185,17 @@ def parameter_posterior(
         ancestors = systematic_resample(weights, rng)
         particles = particles[ancestors].copy()
         log_likelihoods = log_likelihoods[ancestors].copy()
+        log_priors = log_priors[ancestors].copy()
         log_weights.fill(-np.log(count))
 
         if model.parameter_count == 0 or config.rejuvenation_steps == 0:
             continue
         spread = np.std(particles, axis=0)
-        prior_width = model.prior.upper - model.prior.lower
+        prior_width = np.asarray(model.prior.proposal_scale_hint, dtype=float)
+        if prior_width.shape != (model.parameter_count,) or np.any(
+            ~np.isfinite(prior_width) | (prior_width <= 0)
+        ):
+            raise ValueError("prior.proposal_scale_hint must contain one positive finite scale per parameter")
         proposal_std = np.maximum(
             config.proposal_scale * spread,
             np.maximum(config.minimum_proposal_scale, prior_width * 1e-6),
@@ -194,7 +212,7 @@ def parameter_posterior(
                 )[0]
                 if not np.isfinite(proposal_likelihood):
                     continue
-                current_prior = model.prior.logpdf(particles[index])
+                current_prior = log_priors[index]
                 log_acceptance = (
                     beta * (proposal_likelihood - log_likelihoods[index])
                     + proposal_prior
@@ -203,6 +221,7 @@ def parameter_posterior(
                 if np.log(rng.random()) < min(0.0, log_acceptance):
                     particles[index] = proposal
                     log_likelihoods[index] = proposal_likelihood
+                    log_priors[index] = proposal_prior
                     accepted += 1
 
     return ParameterPosterior(
@@ -214,4 +233,8 @@ def parameter_posterior(
         acceptance_rate=accepted / attempted if attempted else 0.0,
         ess_before_resampling=tuple(ess_before_resampling),
         last_rung_forced_below_target=last_rung_forced_below_target,
+        log_priors=log_priors,
+        map_log_priors=np.asarray(
+            [model.metadata.get("map_log_prior", model.prior.logpdf)(x) for x in particles]
+        ),
     )

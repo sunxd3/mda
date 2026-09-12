@@ -3,13 +3,34 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Protocol, runtime_checkable
 
 import numpy as np
 
 
 Array = np.ndarray
 PredictFn = Callable[[Array, Any], Array]
+
+
+@runtime_checkable
+class Prior(Protocol):
+    """Distribution over a model's flat parameter vector.
+
+    ``proposal_scale_hint`` gives a per-coordinate physical (or sampler-coordinate)
+    random-walk scale.  It is a scale hint, not a support bound.
+    """
+
+    names: tuple[str, ...]
+
+    @property
+    def dimension(self) -> int: ...
+
+    @property
+    def proposal_scale_hint(self) -> Array: ...
+
+    def sample(self, rng: np.random.Generator, count: int) -> Array: ...
+
+    def logpdf(self, theta: Array) -> float: ...
 
 
 @dataclass(frozen=True)
@@ -49,6 +70,10 @@ class UniformPrior:
     def dimension(self) -> int:
         return len(self.names)
 
+    @property
+    def proposal_scale_hint(self) -> Array:
+        return self.upper - self.lower
+
     def sample(self, rng: np.random.Generator, count: int) -> Array:
         return rng.uniform(self.lower, self.upper, size=(count, self.dimension))
 
@@ -78,7 +103,7 @@ class CandidateModel:
     """One model-structure particle and its parameter prior."""
 
     name: str
-    prior: UniformPrior
+    prior: Prior
     predict: PredictFn
     structure: str | None = None
     predict_target: PredictFn | None = None

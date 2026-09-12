@@ -4,8 +4,129 @@ from __future__ import annotations
 
 import argparse
 import json
+from typing import Any
 
+from mda.agent import AgentConfig, ModelDiscoveryAgent
+from mda.likelihoods import BootstrapParticleFilter, DeterministicGaussianLikelihood
+from mda.neuron_stochastic import (
+    StochasticNeuronBenchEnvironment,
+    stochastic_neuron_candidate,
+    stochastic_trace_features,
+)
+from mda.neuronbench_adapter import (
+    NeuronBenchEnvironment,
+    NeuronBenchProposer,
+    reference_neuron_candidate,
+    trace_features,
+)
 from mda.openai_client import OpenAIJSONClient
+from mda.smc import SMCConfig
+
+
+class _StochasticNeuronProposer:
+    """Compile the structured hypotheses emitted by the shared proposer as PF models."""
+
+    def __init__(self, proposer, *, channel_count: int, prediction_rollouts: int, seed: int):
+        self.proposer = proposer
+        self.channel_count = channel_count
+        self.prediction_rollouts = prediction_rollouts
+        self.seed = seed
+
+    def propose(self, **kwargs):
+        deterministic = self.proposer.propose(**kwargs)
+        return [
+            stochastic_neuron_candidate(
+                model.metadata.get("neuron_hypothesis"),
+                channel_count=self.channel_count,
+                prediction_rollouts=self.prediction_rollouts,
+                seed=self.seed,
+            )
+            for model in deterministic
+        ]
+
+
+def make_agent(
+    environment: NeuronBenchEnvironment | StochasticNeuronBenchEnvironment,
+    client: Any,
+    *,
+    seed: int = 0,
+    smoke: bool = False,
+    experiment_budget: int = 6,
+) -> ModelDiscoveryAgent:
+    """Construct the Appendix H.4 NeuronBench reproduction agent.
+
+    Smoke mode preserves the same model and data contracts while sharply
+    reducing numerical work; it is not suitable for benchmark reporting.
+    """
+    if client is None and not smoke:
+        raise ValueError("client=None is permitted only when smoke=True")
+    stochastic = isinstance(environment, StochasticNeuronBenchEnvironment)
+    feature_fn = stochastic_trace_features if stochastic else trace_features
+    proposal = None if client is None else NeuronBenchProposer(client, feature_fn=feature_fn)
+    prediction_rollouts = 2 if smoke else 200
+    if stochastic:
+        proposer = (
+            None
+            if proposal is None
+            else _StochasticNeuronProposer(
+                proposal,
+                channel_count=environment.channel_count,
+                prediction_rollouts=prediction_rollouts,
+                seed=seed,
+            )
+        )
+        baseline = stochastic_neuron_candidate(
+            None,
+            channel_count=environment.channel_count,
+            prediction_rollouts=prediction_rollouts,
+            seed=seed,
+        )
+        likelihood = BootstrapParticleFilter(3 if smoke else 250, 2.0)
+        observation_covariance = 2.0**2
+    else:
+        proposer = proposal
+        baseline = reference_neuron_candidate()
+        likelihood = DeterministicGaussianLikelihood(environment.observation_std)
+        observation_covariance = 3.0**2
+
+    config = AgentConfig(
+        model_cap=5,
+        new_models_per_expansion=1,
+        model_search_rounds=2,
+        expansion_cap=3,
+        error_threshold=0.18,
+        occam_penalty=2.0,
+        predictive_floor=2.0 if stochastic else 3.0,
+        smc=SMCConfig(
+            parameter_particles=2 if smoke else 200,
+            rejuvenation_steps=0 if smoke else 3,
+            target_ess_fraction=0.5,
+            max_temperatures=3 if smoke else 80,
+        ),
+    )
+    queries = environment.query_actions[:1] if smoke else environment.query_actions
+    models = [baseline]
+    if proposer is not None:
+        models.extend(proposer.propose(
+            context=f"{environment.context}\nExperiment budget remaining: {experiment_budget}.\nCurrent phase: explore.",
+            dataset=environment.initial_data, current_models=models, residuals=(),
+            count=config.model_cap - 1,
+        ))
+    return ModelDiscoveryAgent(
+        context=environment.context,
+        initial_data=environment.initial_data,
+        initial_models=models,
+        proposer=proposer,
+        likelihood=likelihood,
+        actions=environment.actions,
+        observation_covariance=observation_covariance,
+        config=config,
+        target=feature_fn,
+        query_actions=queries,
+        experiment_budget=experiment_budget,
+        action_key=environment.action_key,
+        seed=seed,
+    )
 
 
 def run_baseline(
