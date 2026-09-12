@@ -21,13 +21,14 @@ physics = [
     "ScienceAgent @ git+https://github.com/SampsonML/DiscoverPhysics.git@33b7fa9df96de9c35744efd181ca7e5a8dd60ad5#subdirectory=ScienceAgent",
 ]
 design = ["cma>=4.0"]
+recovery = ["scipy>=1.11", "sympy>=1.12"]
 neuron = [
     "neuronbench @ git+https://github.com/murphyk/neuronbench.git@c354622458c460b419cab821d482c879f0578377",
 ]
 baselines = ["neurobench>=2.3.0"]
 dev = [
     "pytest>=8.0",
-    "model-discovery-agent[design,llm,neuron,numpyro]",
+    "model-discovery-agent[design,llm,neuron,numpyro,recovery]",
 ]
 
 [project.scripts]

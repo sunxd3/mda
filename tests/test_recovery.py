@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from mda.benchmarks.recovery import evaluate_recovery
+from mda.benchmarks.recovery import canonical_symbolic_candidate, evaluate_recovery
 from mda.expressions import compile_expression
 from mda.types import CandidateModel, UniformPrior
 
@@ -62,3 +62,49 @@ def test_signed_data_requires_explicit_transform():
     assert parameters == pytest.approx([-1.0], abs=1e-7)
     assert rmsle < 1e-7
     assert recovered
+
+
+def test_canonical_form_drives_refitting_and_discriminates_bad_form():
+    prior = UniformPrior(("a", "b"), np.array([0.1, 0.0]), np.array([5.0, 4.0]))
+    equivalent = canonical_symbolic_candidate("b + x*a + a*x", ("x",), prior)
+    wrong = canonical_symbolic_candidate("a*x**2 + b", ("x",), prior)
+    fit, holdout = np.linspace(.1, 2, 30), np.linspace(2.1, 4, 30)
+    truth = lambda x: 3*x + 1.25
+
+    parameters, rmsle, recovered = evaluate_recovery(
+        equivalent, (fit, holdout), (truth, truth), tolerance=1e-6
+    )
+    assert equivalent.structure == "2*a*x + b"
+    assert parameters == pytest.approx([1.5, 1.25], rel=1e-6)
+    assert rmsle < 1e-7 and recovered
+    assert not evaluate_recovery(wrong, (fit, holdout), (truth, truth), tolerance=.01)[2]
+
+
+def test_symbolic_parser_rejects_malicious_syntax_without_execution(tmp_path):
+    marker = tmp_path / "executed"
+    expression = f"__import__('pathlib').Path({str(marker)!r}).touch()"
+    prior = UniformPrior((), np.array([]), np.array([]))
+    with pytest.raises(ValueError, match="approved|unsupported|undeclared"):
+        canonical_symbolic_candidate(expression, ("x",), prior)
+    assert not marker.exists()
+
+
+def test_symbolic_special_functions_and_numpy_aliases_match_scipy():
+    scipy_special = pytest.importorskip("scipy.special")
+    prior = UniformPrior(("a",), np.array([.1]), np.array([2.0]))
+    model = canonical_symbolic_candidate(
+        "a*(np.k0(x) + k1(x) + gamma(x))", ("x",), prior
+    )
+    x = np.array([.5, 1.25, 2.0])
+    expected = .7 * (scipy_special.k0(x) + scipy_special.k1(x) + scipy_special.gamma(x))
+    assert model.predict(np.array([.7]), x) == pytest.approx(expected)
+
+
+def test_recovery_threshold_is_strict():
+    prior = UniformPrior((), np.array([]), np.array([]))
+    model = canonical_symbolic_candidate("0", ("x",), prior)
+    _, rmsle, recovered = evaluate_recovery(
+        model, ([0.0], [1.0]), ([0.0], [np.e - 1.0]), tolerance=1.0
+    )
+    assert rmsle == pytest.approx(1.0)
+    assert not recovered

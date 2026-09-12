@@ -119,8 +119,9 @@ calibration. It must not silently use raw voltage noise for six different featur
 `--agent apprentice` implements the Boxing H.3.2 comparison: one evolving
 model, LLM-selected experiments, and a residual-conditioned refinement on every
 round, fitted by the same SMC. `--icl` adds the data-only forecasting baseline
-after every round (replay/live only). `--recovery` adds ChemBench constant-refit
-recovery scoring; recovery parameters never replace the agent's fitted parameters.
+after every round (replay/live only). `--recovery` adds ChemBench or central
+two-particle ForceBench constant-refit recovery scoring (install `.[recovery]`);
+recovery parameters never replace the agent's fitted parameters.
 The physics driver also accepts `circle`, `ether`, and `hubble`. These extensions
 use documented local launch menus because the exact paper menus are unreleased.
 
@@ -137,9 +138,18 @@ training. Output files are never intentionally overwritten.
 
 `mda.benchmarks.icl.make_icl_predictor` provides a model-free baseline using only
 observed action-target pairs and query inputs. `mda.benchmarks.recovery.evaluate_recovery`
-refits a trusted symbolic candidate's constants on a separate noise-free grid
-and tests held-out RMSLE. This is a numerical approximation, not a proof of
-symbolic equality; it does not parse arbitrary source through SymPy.
+refits a trusted candidate's constants on a separate noise-free grid and tests
+held-out RMSLE. The benchmark evaluators first compile the symbolic law using
+`canonical_symbolic_candidate`: a whitelist AST translation into SymPy, followed
+by simplification and numerical compilation, without parsing arbitrary Python
+through `sympify`. This is a numerical approximation, not proof of symbolic equality.
+ForceBench measures the true radial force through clean public release-at-rest
+experiments, never private force fields. Its local grid has 128 interleaved
+log-spaced radii in [1.5, 10], with a .01 time-unit finite difference; it uses
+signed `log1p` and tolerance .05. This tests the radial profile at unit coupling
+and time zero, not the complete charge/time dependence. Chemistry uses separate
+128-point fit and holdout grids and ordinary `log1p` with tolerance .02. Neither
+grid is claimed to be the authors' unreleased evaluation grid.
 
 `gpt-5.6-luna` does not accept `temperature`; the client omits it for GPT-5.6
 models, requests low reasoning effort, and reserves enough output tokens for
@@ -393,8 +403,8 @@ settings are used rather than Table 14's conflicting deterministic 48/.6 setting
   Brier loss; the remaining tasks use clean-mean nMSE. Dugongs follows Table 8's
   Gaussian observation, not upstream's folded output. Generic 24-design/12-query
   pools are configurable local defaults, not claimed paper evaluation grids.
-- Recovery currently covers chemistry only and lacks SymPy canonicalization;
-  ForceBench functional recovery is not wired into curves. Large benchmark runs, paid
+- Recovery covers chemistry and the six central-force worlds, not the many-body
+  extensions or neuron channel classification. Large benchmark runs, paid
   proposal calls, statistical score matching, and full comparison plots remain
   unexecuted. Learned summaries are future work in v4, not a missing algorithm.
 

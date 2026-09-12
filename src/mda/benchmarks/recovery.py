@@ -1,23 +1,132 @@
-"""Finite-grid numerical structural-recovery check for paper A2/B1.
-
-This module refits only the numerical constants of an already trusted
-``CandidateModel``.  Recovery means that the refitted model has held-out RMSLE
-at most ``tolerance``; it is a finite-grid numerical approximation, not proof
-of exact symbolic equality.  In particular, no SymPy parsing or
-canonicalization is performed.  Symbolic candidates should be constructed by
-the project's safe :func:`mda.expressions.compile_expression`; fitting calls
-the resulting trusted ``candidate.predict`` function and never evaluates the
-raw ``candidate.structure`` string.
-"""
+"""Finite-grid numerical and opt-in symbolic structural recovery (A2/B1)."""
 
 from __future__ import annotations
 
+import ast
+import keyword
 from collections.abc import Mapping, Sequence
 from typing import Any
 
 import numpy as np
 
 from mda.types import CandidateModel, UniformPrior
+
+
+_SYMBOLIC_FUNCTIONS = {
+    "abs", "cos", "exp", "gamma", "k0", "k1", "log", "log10",
+    "maximum", "minimum", "sign", "sin", "sqrt", "tan", "tanh", "where",
+}
+
+
+def canonical_symbolic_candidate(
+    expression: str,
+    input_names: Sequence[str],
+    prior: UniformPrior,
+    *,
+    name: str | None = None,
+) -> CandidateModel:
+    """Safely parse, canonicalize, and compile an explicitly symbolic candidate.
+
+    Python's AST is translated node-by-node; neither ``sympify`` nor evaluation
+    of the supplied text is used.  Inputs and free parameters must be declared.
+    Approved functions may be bare (``exp(x)``) or NumPy-qualified
+    (``np.exp(x)``).  SymPy and SciPy are provided by the ``recovery`` extra.
+    """
+    if not isinstance(prior, UniformPrior):
+        raise TypeError("symbolic recovery requires a UniformPrior")
+    input_names = tuple(input_names)
+    declared = (*input_names, *prior.names)
+    reserved = _SYMBOLIC_FUNCTIONS | {"pi", "e", "np"}
+    if any(not item.isidentifier() or keyword.iskeyword(item) for item in declared):
+        raise ValueError("input and parameter names must be valid Python identifiers")
+    if len(set(input_names)) != len(input_names) or len(set(prior.names)) != len(prior.names):
+        raise ValueError("input and parameter names must be unique")
+    if set(input_names) & set(prior.names):
+        raise ValueError("input and parameter names must be disjoint")
+    if set(declared) & reserved:
+        raise ValueError("input and parameter names cannot shadow functions or constants")
+    try:
+        import sympy as sp
+        from scipy import special
+    except ImportError as error:  # pragma: no cover - depends on installation extras
+        raise RuntimeError("symbolic recovery requires sympy and scipy") from error
+
+    symbols = {item: sp.Symbol(item, real=True) for item in declared}
+    functions = {
+        "abs": sp.Abs, "cos": sp.cos, "exp": sp.exp, "gamma": sp.gamma,
+        "k0": lambda value: sp.besselk(0, value),
+        "k1": lambda value: sp.besselk(1, value),
+        "log": sp.log, "log10": lambda value: sp.log(value, 10),
+        "maximum": sp.Max, "minimum": sp.Min, "sign": sp.sign,
+        "sin": sp.sin, "sqrt": sp.sqrt, "tan": sp.tan, "tanh": sp.tanh,
+        "where": lambda condition, yes, no: sp.Piecewise((yes, condition), (no, True)),
+    }
+    binary = {
+        ast.Add: lambda a, b: a + b, ast.Sub: lambda a, b: a - b,
+        ast.Mult: lambda a, b: a * b, ast.Div: lambda a, b: a / b,
+        ast.Pow: lambda a, b: a**b, ast.Mod: sp.Mod,
+    }
+
+    def translate(node: ast.AST):
+        if isinstance(node, ast.Expression):
+            return translate(node.body)
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            return sp.Integer(node.value) if isinstance(node.value, int) else sp.Float(node.value)
+        if isinstance(node, ast.Name):
+            if node.id in symbols:
+                return symbols[node.id]
+            if node.id == "pi":
+                return sp.pi
+            if node.id == "e":
+                return sp.E
+            raise ValueError(f"undeclared name {node.id!r}")
+        if isinstance(node, ast.BinOp) and type(node.op) in binary:
+            return binary[type(node.op)](translate(node.left), translate(node.right))
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+            value = translate(node.operand)
+            return value if isinstance(node.op, ast.UAdd) else -value
+        if isinstance(node, ast.Call) and not node.keywords:
+            function_name = None
+            if isinstance(node.func, ast.Name):
+                function_name = node.func.id
+            elif (isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name)
+                  and node.func.value.id == "np"):
+                function_name = node.func.attr
+            if function_name in functions:
+                try:
+                    return functions[function_name](*(translate(arg) for arg in node.args))
+                except TypeError as error:
+                    raise ValueError(f"invalid arguments for function {function_name!r}") from error
+            raise ValueError("only approved numerical functions may be called")
+        raise ValueError(f"unsupported expression syntax: {type(node).__name__}")
+
+    try:
+        tree = ast.parse(expression, mode="eval")
+    except SyntaxError as error:
+        raise ValueError("invalid symbolic expression syntax") from error
+    canonical = sp.simplify(translate(tree))
+    ordered_symbols = [symbols[item] for item in declared]
+    numerical = sp.lambdify(
+        ordered_symbols, canonical,
+        modules=[{"besselk": special.kv, "gamma": special.gamma}, "numpy"],
+        cse=True,
+    )
+
+    def predict(theta: np.ndarray, action: Any) -> np.ndarray:
+        theta = np.asarray(theta, dtype=float)
+        if theta.shape != (prior.dimension,):
+            raise ValueError("parameter vector has the wrong shape")
+        if isinstance(action, Mapping):
+            inputs = [action[item] for item in input_names]
+        elif len(input_names) == 1:
+            inputs = [action]
+        else:
+            raise ValueError("multi-input expressions require a mapping action")
+        with np.errstate(all="raise"):
+            return np.asarray(numerical(*inputs, *theta), dtype=float)
+
+    structure = sp.sstr(canonical)
+    return CandidateModel(name or structure, prior, predict, structure=structure)
 
 
 def _transform(values: np.ndarray, signed_log1p: bool) -> np.ndarray:
@@ -144,7 +253,7 @@ def evaluate_recovery(
         # A parameter-free structure still has a meaningful recovery score.
         heldout = residuals(parameters, holdout_actions, holdout_truth)
         rmsle = float(np.sqrt(np.mean(heldout**2)))
-        return parameters, rmsle, bool(rmsle <= tolerance)
+        return parameters, rmsle, bool(rmsle < tolerance)
     starts = min(8, max_evaluations)
     initial = [0.5 * (prior.lower + prior.upper)]
     if starts > 1:
@@ -163,4 +272,4 @@ def evaluate_recovery(
     parameters = best[1]
     heldout = residuals(parameters, holdout_actions, holdout_truth)
     rmsle = float(np.sqrt(np.mean(heldout**2)))
-    return parameters, rmsle, bool(rmsle <= tolerance)
+    return parameters, rmsle, bool(rmsle < tolerance)

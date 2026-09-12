@@ -190,6 +190,38 @@ class PhysicsEnvironment:
             raise ValueError("normalized trajectory MSE is undefined for zero variance")
         return float(np.mean((forecast - truth) ** 2) / variance)
 
+    def evaluate_model(self, model: CandidateModel) -> dict[str, Any]:
+        """A2 radial-force recovery, measured only through clean public launches.
+
+        The paper does not release its grid or finite-difference step. We use
+        interleaved log-radius grids over [1.5, 10] and a .01 time-unit drop.
+        Unit source/probe knobs and t=0 test the radial profile, not full
+        charge/time dependence. Signed log1p preserves repulsive predictions.
+        """
+        from .recovery import canonical_symbolic_candidate, evaluate_recovery
+
+        canonical = canonical_symbolic_candidate(
+            model.structure, ("r", "qi", "qj", "t"), model.prior)
+        radii = np.geomspace(1.5, 10., 128)
+        h = .01
+        launches = [_action(radius) for radius in radii]
+        for action in launches:
+            action["measurement_times"] = [h]
+        with self.executor.noise_disabled():
+            results = self.executor.run(launches)
+        # x(h) = r - F(r) h²/2 + O(h⁴), for a unit probe at rest.
+        force = np.asarray([2 * (radius - result["pos2"][0][0]) / h**2
+                            for radius, result in zip(radii, results, strict=True)])
+        grids = [{"r": float(r), "qi": 1., "qj": 1., "t": 0.} for r in radii]
+        parameters, rmsle, recovered = evaluate_recovery(
+            canonical, (grids[::2], grids[1::2]), (force[::2], force[1::2]),
+            tolerance=.05, signed_log1p=True)
+        return {"parameters": parameters, "rmsle": rmsle, "recovered": recovered,
+                "canonical_structure": canonical.structure,
+                "scope": "unit-coupling radial profile at t=0",
+                "transform": "signed_log1p", "probe_duration": h,
+                "radius_range": [1.5, 10.], "grid_points": len(radii)}
+
 
 def _generic_models(coulomb_roles: bool) -> list[CandidateModel]:
     # Identical hypothesis menu for every world: no hidden-law dispatch.

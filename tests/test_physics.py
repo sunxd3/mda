@@ -49,3 +49,41 @@ def test_qj_is_source_and_qi_is_probe_for_asymmetric_law():
               "measurement_times": [.5]}
     np.testing.assert_allclose(model.observation_prediction(np.array([1.]), action)[0],
                                [2.75, 0], atol=1e-9)
+
+
+def test_recovery_measures_force_without_training_or_hidden_fields():
+    from contextlib import contextmanager
+    from mda.benchmarks.physics import PhysicsEnvironment
+
+    class PublicExecutor:
+        clean = False
+
+        @contextmanager
+        def noise_disabled(self):
+            self.clean = True
+            try:
+                yield
+            finally:
+                self.clean = False
+
+        def run(self, actions):
+            assert self.clean
+            outputs = []
+            for action in actions:
+                assert action["p1"] == action["p2"] == 1
+                assert action["velocity2"] == [0., 0.]
+                r, h = action["pos2"][0], action["measurement_times"][0]
+                # Independent analytic initial-acceleration fixture, F=3/r.
+                outputs.append({"pos2": [[r - .5 * (3/r) * h*h, 0.]]})
+            return outputs
+
+    env = object.__new__(PhysicsEnvironment)
+    env.executor = PublicExecutor()
+    env.initial_data = []
+    right = force_candidate("inverse", "a/r", ("a",), (.1,), (10.,))
+    wrong = force_candidate("square", "a/r**2", ("a",), (.1,), (10.,))
+    result = env.evaluate_model(right)
+    np.testing.assert_allclose(result["parameters"], [3.], atol=1e-6)
+    assert result["recovered"] and result["rmsle"] < 1e-7
+    assert not env.evaluate_model(wrong)["recovered"]
+    assert env.initial_data == [] and not env.executor.clean

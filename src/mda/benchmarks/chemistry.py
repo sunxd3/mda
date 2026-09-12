@@ -130,13 +130,15 @@ class ChemBenchEnvironment:
 
     def evaluate_model(self, model: CandidateModel) -> dict[str, Any]:
         """Constant-refit recovery on fixed grids, isolated from agent fitting."""
-        from .recovery import evaluate_recovery
+        from .recovery import canonical_symbolic_candidate, evaluate_recovery
+        canonical = canonical_symbolic_candidate(model.structure, VARIABLE_NAMES, model.prior)
         truth = lambda action: np.asarray(self.evaluation_oracle.run(action).measurement)
         parameters, rmsle, recovered = evaluate_recovery(
-            model, (_sample_actions(128, 43), _sample_actions(128, 44)),
+            canonical, (_sample_actions(128, 43), _sample_actions(128, 44)),
             (truth, truth), tolerance=.02,
         )
-        return {"parameters": parameters, "rmsle": rmsle, "recovered": recovered}
+        return {"parameters": parameters, "rmsle": rmsle, "recovered": recovered,
+                "canonical_structure": canonical.structure}
 
 
 def _generic_models() -> list[CandidateModel]:
@@ -148,7 +150,7 @@ def _generic_models() -> list[CandidateModel]:
     linear = CandidateModel(
         "linear", UniformPrior(names, np.full(8, -10.0), np.full(8, 10.0)),
         lambda theta, action: np.asarray(theta[0] + sum(theta[i + 1] * float(action[name]) for i, name in enumerate(VARIABLE_NAMES))),
-        structure="a + sum(b_i*x_i)",
+        structure="a + " + " + ".join(f"b_{name}*{name}" for name in VARIABLE_NAMES),
     )
     return [constant, linear]
 
