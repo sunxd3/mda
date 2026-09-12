@@ -128,8 +128,9 @@ class ChemBenchEnvironment:
         """Return held-out log1p MSE normalized by clean log-rate variance."""
         return self.evaluation_metrics(predictor)["nmsle"]
 
-    def evaluate_model(self, model: CandidateModel) -> dict[str, Any]:
+    def evaluate_model(self, model: CandidateModel, parameters=None) -> dict[str, Any]:
         """Constant-refit recovery on fixed grids, isolated from agent fitting."""
+        del parameters  # Recovery refits constants rather than scoring their learned values.
         from .recovery import canonical_symbolic_candidate, evaluate_recovery
         canonical = canonical_symbolic_candidate(model.structure, VARIABLE_NAMES, model.prior)
         truth = lambda action: np.asarray(self.evaluation_oracle.run(action).measurement)

@@ -122,6 +122,11 @@ round, fitted by the same SMC. `--icl` adds the data-only forecasting baseline
 after every round (replay/live only). `--recovery` adds ChemBench or central
 two-particle ForceBench constant-refit recovery scoring (install `.[recovery]`);
 recovery parameters never replace the agent's fitted parameters.
+For NeuronBench, the same flag scores the coarse inward/outward,
+depolarisation/hyperpolarisation, transient/persistent channel class (or slow Na),
+not exact kinetics. The evaluator uses the proposed channel properties, not its
+name; zero conductance or reversal exactly at the local -65 mV reference yields
+"unknown". Calcium and z-rebound intentionally share a class.
 The physics driver also accepts `circle`, `ether`, and `hubble`. These extensions
 use documented local launch menus because the exact paper menus are unreleased.
 
@@ -403,8 +408,8 @@ settings are used rather than Table 14's conflicting deterministic 48/.6 setting
   Brier loss; the remaining tasks use clean-mean nMSE. Dugongs follows Table 8's
   Gaussian observation, not upstream's folded output. Generic 24-design/12-query
   pools are configurable local defaults, not claimed paper evaluation grids.
-- Recovery covers chemistry and the six central-force worlds, not the many-body
-  extensions or neuron channel classification. Large benchmark runs, paid
+- Recovery covers chemistry, the six central-force worlds, and coarse neuron
+  channel classes, not the many-body extensions. Large benchmark runs, paid
   proposal calls, statistical score matching, and full comparison plots remain
   unexecuted. Learned summaries are future work in v4, not a missing algorithm.
 

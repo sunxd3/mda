@@ -101,7 +101,7 @@ def run(environment, agent, *, budget, smoke=False, prediction="map",
         })
         if recovery:
             try:
-                history[-1]["recovery"] = environment.evaluate_model(fit.model)
+                history[-1]["recovery"] = environment.evaluate_model(fit.model, fit.parameters.map_parameters)
             except ValueError as error:
                 history[-1]["recovery"] = {"error": str(error), "recovered": False}
         if icl_client is not None:
@@ -156,7 +156,7 @@ def main():
     parser.add_argument("--task-noise-variance", type=float, nargs="+")
     parser.add_argument("--no-m-open", action="store_true")
     parser.add_argument("--icl", action="store_true", help="also forecast using only the collected data")
-    parser.add_argument("--recovery", action="store_true", help="chemistry or central-force symbolic recovery diagnostic")
+    parser.add_argument("--recovery", action="store_true", help="symbolic-law or coarse neuron-class recovery diagnostic")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.budget < 0:
@@ -178,9 +178,9 @@ def main():
         parser.error("random design currently requires a finite menu")
     if args.icl and args.smoke:
         parser.error("ICL needs a replay or explicitly authorized live client")
-    if args.recovery and (args.domain not in {"chemistry", "physics"}
+    if args.recovery and (args.domain not in {"chemistry", "physics", "neuron"}
                           or args.world in {"circle", "ether", "hubble"}):
-        parser.error("recovery supports chemistry and central two-particle physics only")
+        parser.error("recovery supports chemistry, central two-particle physics, and neuron")
     client = None
     if not args.smoke:
         if args.provider == "anthropic":

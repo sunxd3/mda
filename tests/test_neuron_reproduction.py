@@ -68,3 +68,34 @@ def test_stochastic_evaluation_uses_component_query_variance(monkeypatch):
     )
     expected = np.mean(np.arange(1, 7, dtype=float) ** 2 / np.var(np.arange(6)))
     assert score == pytest.approx(expected)
+
+
+def test_structural_recovery_uses_channel_properties_not_names():
+    from dataclasses import replace
+    from mda.neuronbench_adapter import evaluate_neuron_recovery
+    spec = NeuronHypothesis(
+        "deliberately misleading h_sag name", "channel", 120., "depol", True,
+        6., 2, -87., 4., 22., (0., 8.), (-65., -45.), (12., 180.),
+    )
+    model = neuron_candidate(spec)
+    theta = np.array([.3, 3., -54., 22.])
+    assert evaluate_neuron_recovery("ca_rebound", model, theta)["recovered"]
+    assert evaluate_neuron_recovery("z_rebound", model, theta)["recovered"]
+    assert not evaluate_neuron_recovery("h_sag", model, theta)["recovered"]
+    theta[1] = 0
+    assert evaluate_neuron_recovery("ca_rebound", model, theta)["class"] == "unknown"
+    theta[1] = 3
+    outward = neuron_candidate(replace(spec, reversal_mv=-77.))
+    assert evaluate_neuron_recovery("d_type", outward, theta)["recovered"]
+    degenerate = neuron_candidate(replace(spec, reversal_mv=-65.))
+    assert evaluate_neuron_recovery("d_type", degenerate, theta)["class"] == "unknown"
+
+
+def test_recovery_runner_passes_fitted_neuron_parameters():
+    from mda.benchmarks.reproduce import run
+    environment = NeuronBenchEnvironment("ca_rebound", seed=2)
+    agent = make_agent(environment, None, smoke=True, experiment_budget=0)
+    result = run(environment, agent, budget=0, smoke=True, evaluate=False, recovery=True)
+    recovery = result["history"][0]["recovery"]
+    assert recovery["class"] == "unknown"  # Plain baseline has no extra channel.
+    assert not recovery["recovered"]

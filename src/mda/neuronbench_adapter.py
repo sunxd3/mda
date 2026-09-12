@@ -222,12 +222,47 @@ def reference_neuron_candidate() -> CandidateModel:
     )
 
 
+def evaluate_neuron_recovery(world_name: str, model: CandidateModel, parameters: np.ndarray) -> dict:
+    """A2's coarse channel label, for evaluation only (Table 11).
+
+    Direction is measured relative to -65 mV resting voltage, an explicit
+    local convention because the authors' classifier is not released.
+    Distinct calcium/rebound kinetics deliberately share a coarse class.
+    """
+    expected = {
+        "z_rebound": "inward/depol/transient",
+        "ca_rebound": "inward/depol/transient",
+        "h_sag": "inward/hyperpol/persistent",
+        "d_type": "outward/depol/transient",
+        "textbook_M": "outward/depol/persistent",
+        "na_fatigue": "slow_na",
+    }
+    if world_name not in expected:
+        raise ValueError("no published structural class for this neuron world")
+    spec = model.metadata.get("neuron_hypothesis")
+    values = dict(zip(model.prior.names, np.asarray(parameters), strict=True))
+    label = "unknown"
+    if spec is not None:
+        if spec.mechanism_type == "slow_na":
+            if np.isfinite(values.get("tau_s_ms", np.nan)) and values["tau_s_ms"] > 0:
+                label = "slow_na"
+        elif (np.isfinite(values.get("g", np.nan)) and values["g"] > 0
+              and np.isfinite(spec.reversal_mv) and spec.reversal_mv != -65):
+            direction = "inward" if spec.reversal_mv > -65 else "outward"
+            persistence = "transient" if spec.inactivates else "persistent"
+            label = f"{direction}/{spec.opens_on}/{persistence}"
+    return {"class": label, "expected_class": expected[world_name],
+            "recovered": label == expected[world_name], "reference_voltage_mv": -65.,
+            "scope": "coarse channel class, not kinetic or parameter recovery"}
+
+
 class NeuronBenchEnvironment:
     """Algorithm 1 environment facade with the paper's fixed two-protocol D0."""
 
     def __init__(self, world_name: str, *, seed: int = 0) -> None:
         nb = _neuronbench()
         self.world = nb.load_world(world_name, stochastic=False, seed=seed)
+        self.world_name = world_name
         self.context = (
             "A single-compartment conductance-based Hodgkin-Huxley neuron has standard Na+/K+ "
             "spiking currents and may contain a novel membrane mechanism. " + self.world.text_prior
@@ -272,6 +307,9 @@ class NeuronBenchEnvironment:
 
     def step(self, protocol) -> np.ndarray:
         return self.world.run(protocol).voltage
+
+    def evaluate_model(self, model: CandidateModel, parameters: np.ndarray) -> dict:
+        return evaluate_neuron_recovery(self.world_name, model, parameters)
 
 
 class NeuronBenchProposer:

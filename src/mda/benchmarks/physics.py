@@ -190,7 +190,7 @@ class PhysicsEnvironment:
             raise ValueError("normalized trajectory MSE is undefined for zero variance")
         return float(np.mean((forecast - truth) ** 2) / variance)
 
-    def evaluate_model(self, model: CandidateModel) -> dict[str, Any]:
+    def evaluate_model(self, model: CandidateModel, parameters=None) -> dict[str, Any]:
         """A2 radial-force recovery, measured only through clean public launches.
 
         The paper does not release its grid or finite-difference step. We use
@@ -198,6 +198,7 @@ class PhysicsEnvironment:
         Unit source/probe knobs and t=0 test the radial profile, not full
         charge/time dependence. Signed log1p preserves repulsive predictions.
         """
+        del parameters  # This diagnostic refits the free constants.
         from .recovery import canonical_symbolic_candidate, evaluate_recovery
 
         canonical = canonical_symbolic_candidate(

@@ -16,6 +16,7 @@ import numpy as np
 from .neuronbench_adapter import (
     NeuronHypothesis,
     _neuronbench,
+    evaluate_neuron_recovery,
     neuron_candidate,
     reference_neuron_candidate,
 )
@@ -238,6 +239,9 @@ class StochasticNeuronBenchEnvironment:
 
     def step(self, protocol) -> np.ndarray:
         return self.world.run(protocol).voltage
+
+    def evaluate_model(self, model: CandidateModel, parameters: np.ndarray) -> dict:
+        return evaluate_neuron_recovery(self.world_name, model, parameters)
 
     def evaluate_predictor(self, predictor) -> float:
         nb = _neuronbench()
