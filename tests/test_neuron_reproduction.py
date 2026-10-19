@@ -111,3 +111,12 @@ def test_recovery_runner_passes_fitted_neuron_parameters():
     recovery = result["history"][0]["recovery"]
     assert recovery["class"] == "unknown"  # Plain baseline has no extra channel.
     assert not recovery["recovered"]
+
+
+def test_stochastic_menu_allows_repeats_only_once_exhausted():
+    environment = StochasticNeuronBenchEnvironment("ca_rebound", seed=3)
+    agent = make_agent(environment, None, smoke=True, experiment_budget=8)
+    unused = agent.available_actions()
+    assert len(unused) == 7 and agent.config.repeat_when_exhausted
+    agent.used_action_keys.update(agent.action_key(action) for action in unused)
+    assert len(agent.available_actions()) == len(environment.actions)

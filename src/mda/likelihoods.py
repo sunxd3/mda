@@ -58,7 +58,7 @@ class DeterministicGaussianLikelihood:
 def _simulate_traces(model, theta, datum, count, std, rng) -> np.ndarray:
     """Draw ``count`` noisy trajectories with the datum's shape from the SSM."""
     observations = np.asarray(datum.observation, dtype=float)
-    shape = observations.shape if observations.ndim == 2 else (len(observations), 1)
+    shape = observations.shape if observations.ndim == 2 else (observations.size, 1)
     state_model = model.state_space
     states = np.asarray(state_model.initial_state(theta, datum.action, count, rng), dtype=float)
     traces = np.empty((count, *shape))
@@ -70,7 +70,7 @@ def _simulate_traces(model, theta, datum, count, std, rng) -> np.ndarray:
             state_model.observation_mean(states, theta, datum.action, time_index), dtype=float
         ).reshape(count, shape[1])
         traces[:, time_index] = means + rng.normal(0.0, 1.0, means.shape) * std
-    return traces if observations.ndim == 2 else traces[..., 0]
+    return traces if observations.ndim == 2 else traces.reshape(count, *observations.shape)
 
 
 @dataclass(frozen=True)
@@ -171,6 +171,8 @@ class BootstrapParticleFilter:
         state_model = model.state_space
         for datum in dataset:
             observations = np.asarray(datum.observation, dtype=float)
+            if observations.ndim == 0:  # a single scalar observation (T = 1)
+                observations = observations.reshape(1, 1)
             if observations.ndim == 1:
                 observations = observations[:, None]
             if observations.ndim != 2:
@@ -201,6 +203,9 @@ class BootstrapParticleFilter:
                 log_weights = -0.5 * np.sum(
                     residual * residual + 2 * np.log(std) + np.log(2 * np.pi), axis=1
                 )
+                # A diverged particle (NaN or infinite state) gets zero weight
+                # instead of voiding the estimate; resampling then drops it.
+                log_weights = np.where(np.isfinite(log_weights), log_weights, -np.inf)
                 increment = logsumexp(log_weights) - np.log(self.latent_particles)
                 if not np.isfinite(increment):
                     return -np.inf

@@ -36,13 +36,9 @@ class BeliefState:
             or not np.isclose(weights.sum(), 1.0)
         ):
             raise ValueError("model weights must be normalized and align with fits")
-        positive = weights > 0.0
-        object.__setattr__(
-            self,
-            "fits",
-            tuple(fit for fit, keep in zip(self.fits, positive, strict=True) if keep),
-        )
-        object.__setattr__(self, "model_weights", weights[positive])
+        # Fits whose weight underflows to zero stay in the pool: v5 keeps valid
+        # older models, and later data can restore their weight.
+        object.__setattr__(self, "model_weights", weights)
 
     @property
     def map_index(self) -> int:
@@ -53,7 +49,10 @@ class BeliefState:
         return self.fits[self.map_index]
 
     def iter_parameter_particles(self) -> Iterator[tuple[CandidateModel, np.ndarray, float]]:
+        """Weighted (model, theta) pairs with positive model weight."""
         for model_weight, fit in zip(self.model_weights, self.fits, strict=True):
+            if model_weight == 0.0:
+                continue
             for theta, parameter_weight in zip(
                 fit.parameters.particles, fit.parameters.weights, strict=True
             ):
@@ -117,8 +116,9 @@ def fit_model_posterior(
     log_mixture_evidence = logsumexp(scores) - logsumexp(log_model_prior_scores)
 
     all_weights, _ = normalize_log_weights(scores)
-    order = np.argsort(-scores, kind="stable")
-    keep = order[: min(model_cap, len(order))]
+    # Structures whose fit failed entirely (non-finite evidence) leave the pool.
+    order = [index for index in np.argsort(-scores, kind="stable") if np.isfinite(scores[index])]
+    keep = np.asarray(order[: min(model_cap, len(order))], dtype=int)
     discarded_mass = float(1.0 - all_weights[keep].sum())
     kept_scores = scores[keep]
     kept_weights, _ = normalize_log_weights(kept_scores)

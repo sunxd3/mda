@@ -6,10 +6,10 @@ import numpy as np
 import pytest
 
 from mda.acquisition import (
-    full_observation_task_value_of_information,
+    choose_design, full_observation_task_value_of_information,
     joint_eig, model_eig, task_value_of_information,
 )
-from mda.posterior import BeliefState, ModelFit
+from mda.posterior import BeliefState, ModelFit, fit_model_posterior
 from mda.smc import ParameterPosterior
 from mda.types import CandidateModel, UniformPrior
 
@@ -56,15 +56,42 @@ def test_task_voi_is_larger_for_query_correlated_design():
     assert null == 0.0
 
 
-def test_manually_constructed_belief_drops_zero_mass_fit():
+def test_zero_mass_fit_stays_in_pool_but_not_in_design_scores():
     good = fit("good", [[0.0]], lambda theta, x: np.asarray(1.0))
     invalid = fit("invalid", [[0.0]], lambda theta, x: np.asarray(np.nan))
     belief = BeliefState((good, invalid), np.asarray([1.0, 0.0]))
 
-    assert belief.fits == (good,)
-    assert belief.model_weights.tolist() == [1.0]
+    assert belief.fits == (good, invalid)
+    assert belief.model_weights.tolist() == [1.0, 0.0]
     assert model_eig(0.0, belief, 1.0) == 0.0
     assert joint_eig(0.0, belief, 1.0) == 0.0
+
+
+def test_model_posterior_keeps_underflowed_models_and_drops_failed_fits():
+    from mda.smc import SMCConfig
+
+    def evidence_for(scores):
+        def evidence(dataset, model, likelihood, rng):
+            return replace(fit(model.name, [[0.0]], model.predict).parameters,
+                           log_evidence=scores[model.name])
+        return evidence
+
+    models = [fit(name, [[0.0]], lambda theta, x: np.asarray(0.0)).model for name in ("best", "far", "failed")]
+    belief = fit_model_posterior(
+        [], models, None, SMCConfig(), model_cap=16, occam_penalty=0.0, rng=np.random.default_rng(0),
+        evidence=evidence_for({"best": 0.0, "far": -2000.0, "failed": -np.inf}),
+    )
+    assert [f.model.name for f in belief.fits] == ["best", "far"]
+    assert belief.model_weights.tolist() == [1.0, 0.0]
+
+
+def test_design_skips_actions_a_weighted_model_cannot_predict():
+    left = fit("left", [[0.0]], lambda theta, x: np.asarray(np.inf if x == "bad" else 0.0))
+    right = fit("right", [[0.0]], lambda theta, x: np.asarray(1.0))
+    belief = BeliefState((left, right), np.asarray([0.5, 0.5]))
+    action, scores = choose_design(["bad", "good"], belief, flavour="model", observation_covariance=1.0)
+    assert action == "good"
+    assert scores[0] == -np.inf
 
 
 def test_task_uses_targets_at_design_not_raw_observations():

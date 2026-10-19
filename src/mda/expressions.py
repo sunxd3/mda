@@ -103,7 +103,7 @@ def compile_expressions(
     for expression in expressions:
         if not isinstance(expression, str) or not expression.strip():
             raise ValueError("expressions must be nonempty strings")
-        tree = ast.parse(expression.strip(), mode="eval")
+        tree = _parse(expression.strip())
         _validate_tree(tree, set(names) | set(allowed) | {"pi", "e"}, allowed)
         trees.append(tree.body)
     code = compile(ast.Expression(ast.fix_missing_locations(ast.Tuple(trees, ast.Load()))),
@@ -115,6 +115,14 @@ def compile_expressions(
             return tuple(np.asarray(value, dtype=float) for value in eval(code, {"__builtins__": {}}, environment))
 
     return evaluate
+
+
+def _parse(expression: str) -> ast.Expression:
+    """Parse untrusted text, reporting malformed syntax as ValueError."""
+    try:
+        return ast.parse(expression, mode="eval")
+    except (SyntaxError, RecursionError, MemoryError) as error:
+        raise ValueError(f"malformed expression: {error}") from None
 
 
 def compile_expression(
@@ -137,7 +145,7 @@ def compile_expression(
     if set(declared) & reserved:
         raise ValueError("variable and parameter names cannot shadow functions or constants")
 
-    tree = ast.parse(expression, mode="eval")
+    tree = _parse(expression)
     _validate_tree(tree, set(declared) | reserved, _FUNCTIONS)
     code = compile(tree, "<mda-expression>", "eval")
 
@@ -329,6 +337,8 @@ scientifically plausible uniform-prior bounds. Return JSON only."""
                     model.observation_prediction(prior.sample(np.random.default_rng(0), 1)[0], datum.action)
                 models.append(model)
                 existing.add(expression)
-            except (KeyError, TypeError, ValueError):
+            except (KeyError, TypeError, ValueError, ArithmeticError):
+                # Invalid laws, including ones that overflow or divide by zero
+                # at the screening points, are dropped as v5 requires.
                 continue
         return models[:count]

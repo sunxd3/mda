@@ -109,6 +109,9 @@ def make_agent(
         new_models_per_expansion=1,
         model_search_rounds=2,
         expansion_cap=0 if stochastic and not online_expansion else 3,
+        # v5 runs 2+8 experiments on a 90-action menu; the released pool has
+        # only seven unused protocols, so repeats begin once it is exhausted.
+        repeat_when_exhausted=stochastic,
         error_threshold=0.18,
         occam_penalty=2.0,
         predictive_floor=2.0 if stochastic else 3.0,

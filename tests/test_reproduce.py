@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -88,3 +89,36 @@ def test_random_runner_honors_remaining_budget():
     env, agent = build("boxing", "death", None, seed=1, smoke=True, budget=0)
     with pytest.raises(ValueError, match="remaining experiment budget"):
         run(env, agent, budget=1, design="random")
+
+
+def test_unevaluable_law_is_recorded_as_a_failure_not_an_abort():
+    env, agent = build("boxing", "death", None, seed=1, smoke=True, budget=0)
+
+    class Unevaluable:
+        query_actions = env.query_actions
+
+        def evaluation_metrics(self, predictor):
+            return {"nmsle": np.inf, "rmsle": np.inf, "passed": False}
+
+    agent.predict = lambda action, flavour="map": np.asarray(np.inf)
+    result = run(Unevaluable(), agent, budget=0)
+    row = result["history"][0]
+    assert row["evaluable"] is False and row["score"] is None
+    assert row["metrics"] == {"nmsle": None, "rmsle": None, "passed": False}
+    json.dumps(result, default=_json_default, allow_nan=False)
+
+
+def test_random_designs_do_not_depend_on_inference_randomness():
+    actions = []
+    for particles in (8, 24):
+        env, agent = build("boxing", "irt", None, seed=5, smoke=True, budget=3)
+        agent.config = replace(agent.config, smc=replace(agent.config.smc, parameter_particles=particles))
+        history = run(env, agent, budget=3, smoke=True, design="random", evaluate=False)["history"]
+        actions.append([repr(row["action"]) for row in history[1:]])
+    assert actions[0] == actions[1]
+
+
+def test_budget_beyond_the_unused_menu_fails_before_running():
+    env, agent = build("boxing", "death", None, seed=1, smoke=True, budget=1000)
+    with pytest.raises(ValueError, match="unused designs"):
+        run(env, agent, budget=len(agent.available_actions()) + 1, smoke=True)

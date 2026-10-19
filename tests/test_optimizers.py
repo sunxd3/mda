@@ -73,3 +73,15 @@ def test_no_finite_score_raises_and_respects_budget():
     with pytest.raises(ValueError, match="finite score"):
         CMAESOptimizer([0.0], [1.0], max_evaluations=3)(score, np.random.default_rng(0))
     assert calls == 3
+
+
+def test_flat_score_still_spends_the_full_budget():
+    calls = 0
+
+    def score(_):
+        nonlocal calls
+        calls += 1
+        return 0.0
+
+    CMAESOptimizer([0.0] * 7, [1.0] * 7, max_evaluations=48)(score, np.random.default_rng(0))
+    assert calls == 48

@@ -34,6 +34,7 @@ class AgentConfig:
     shrink_confidence: float = 0.9
     initial_proposals: int = 0
     expansion_gate: str = "prequential"
+    repeat_when_exhausted: bool = False
 
     def __post_init__(self) -> None:
         if self.model_cap < 1 or self.new_models_per_expansion < 1:
@@ -106,6 +107,7 @@ class ModelDiscoveryAgent:
         self.experiments_run = 0
         self.active_model_cap = config.model_cap
         self.action_key = action_key
+        self.seed = seed
         self.rng = np.random.default_rng(seed)
         self.expansion_count = 0
         self.used_action_keys = {action_key(datum.action) for datum in initial_data}
@@ -192,7 +194,18 @@ class ModelDiscoveryAgent:
     def available_actions(self) -> list[Any]:
         if self.config.repeat_designs:
             return list(self.actions)
-        return [action for action in self.actions if self.action_key(action) not in self.used_action_keys]
+        unused = [action for action in self.actions if self.action_key(action) not in self.used_action_keys]
+        if not unused and self.config.repeat_when_exhausted:
+            return list(self.actions)
+        return unused
+
+    def random_design_rng(self) -> np.random.Generator:
+        """A generator that depends only on the seed, not on inference.
+
+        Random-design controls drawn from it share their design history across
+        inference arms, as v5's ChemBench controls require.
+        """
+        return np.random.default_rng(np.random.SeedSequence([self.seed, 0xD5]))
 
     def design(self) -> Any:
         if self.experiment_budget is not None and self.experiments_run >= self.experiment_budget:
@@ -293,7 +306,12 @@ class ModelDiscoveryAgent:
         )
 
     def _expand(self) -> bool:
-        """One ``expand-hyp-space`` call and re-judge; False if nothing new was added."""
+        """One ``expand-hyp-space`` call and re-judge; False if no call was allowed.
+
+        As in v5 Algorithm 2, every call counts toward ``expansion_cap``
+        (N_e^max), including one whose proposals are all invalid or duplicates;
+        the search then continues with the next round.
+        """
         if self.expansion_count >= self.config.expansion_cap or self.proposer is None:
             return False
         reports = [
@@ -312,16 +330,15 @@ class ModelDiscoveryAgent:
             residuals=reports,
             count=self.config.new_models_per_expansion,
         )
+        self.expansion_count += 1
         existing_keys = {model.key for model in self.models}
         novel = []
         for proposal in proposals:
             if proposal.key not in existing_keys:
                 novel.append(proposal)
                 existing_keys.add(proposal.key)
-        if not novel:
-            return False
-        self.belief = self._fit([*self.models, *novel], reuse=True)
-        self.expansion_count += 1
+        if novel:
+            self.belief = self._fit([*self.models, *novel], reuse=True)
         return True
 
     def get_model(self) -> CandidateModel:

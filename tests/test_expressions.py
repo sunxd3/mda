@@ -128,3 +128,21 @@ def test_symbolic_proposer_reports_signed_input_correlations_and_full_model_pool
     assert correlations == [{
         "structure": "a*x", "input_signed_residual_correlations": {"x": -1.0}
     }]
+
+
+def test_symbolic_proposer_drops_malformed_and_overflowing_laws():
+    hypotheses = [
+        {"name": "syntax", "expr": "a*(x - ", "params": [{"name": "a", "low": 0.1, "high": 2.0}]},
+        {"name": "log zero", "expr": "a*log(y)", "params": [{"name": "a", "low": 0.1, "high": 2.0}]},
+        {"name": "valid", "expr": "a*x", "params": [{"name": "a", "low": 0.1, "high": 2.0}]},
+    ]
+
+    class Client:
+        def ask_json(self, system, prompt, **kwargs):
+            return {"hypotheses": hypotheses}
+
+    dataset = [Datum({"x": x, "y": 0.0}, np.asarray(x)) for x in (1.0, 2.0, 3.0)]
+    models = SymbolicRegressionProposer(Client(), variable_names=("x", "y")).propose(
+        context="", dataset=dataset, current_models=(), residuals=(), count=3,
+    )
+    assert [model.name for model in models] == ["valid"]

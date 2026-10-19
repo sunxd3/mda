@@ -11,6 +11,8 @@ from typing import Any
 
 import numpy as np
 
+from mda.types import NonFinitePrediction
+
 
 def build(domain, world, client, *, seed, smoke, budget, stochastic=False,
           difficulty="medium", allow_code_execution=False, method="mda",
@@ -80,13 +82,23 @@ def run(environment, agent, *, budget, smoke=False, prediction="map",
     def snapshot(action=None, observation=None):
         nonlocal best
         predictor = agent.get_predictor(prediction)
-        predictions = [np.asarray(predictor(a)) for a in agent.query_actions]
-        if any(np.any(~np.isfinite(p)) for p in predictions):
+        scored_by_metrics = hasattr(environment, "evaluation_metrics")
+        try:
+            predictions = [np.asarray(predictor(a)) for a in agent.query_actions]
+            evaluable = all(np.all(np.isfinite(p)) for p in predictions)
+        except (NonFinitePrediction, ArithmeticError):
+            predictions, evaluable = [], False
+        if not evaluable and not scored_by_metrics:
             raise ValueError("non-finite query prediction")
         metrics = None
-        if evaluate and hasattr(environment, "evaluation_metrics"):
+        if evaluate and scored_by_metrics:
             metrics = environment.evaluation_metrics(predictor)
             score = float(metrics["nmsle"])
+            if not np.isfinite(score):
+                # v5 ChemBench: a law that cannot be evaluated over the test
+                # range counts as a failure rather than aborting the run.
+                evaluable, score = False, None
+                metrics = {"nmsle": None, "rmsle": None, "passed": False}
         else:
             score = float(environment.evaluate_predictor(predictor)) if evaluate else None
         if score is not None:
@@ -106,6 +118,7 @@ def run(environment, agent, *, budget, smoke=False, prediction="map",
             "forced_tempering": [f.parameters.last_rung_forced_below_target for f in agent.belief.fits],
             "predictive_error": agent.last_predictive_error,
             "expansions": agent.expansion_count,
+            "evaluable": evaluable,
         })
         if metrics is not None:
             history[-1]["metrics"] = metrics
@@ -121,18 +134,23 @@ def run(environment, agent, *, budget, smoke=False, prediction="map",
             # Shape, not numerical predictions, is the sole model-derived input.
             icl = make_icl_predictor(icl_client, environment.context, agent.dataset,
                 environment.query_actions, target=agent.target, action_features=features,
-                action_key=agent.action_key, target_shape=predictions[0].shape)
+                action_key=agent.action_key,
+                target_shape=np.shape(agent.target(agent.dataset[0].observation, agent.dataset[0].action)))
             history[-1]["icl_score"] = float(environment.evaluate_predictor(icl))
 
+    if agent.optimizer is None and not (agent.config.repeat_designs or agent.config.repeat_when_exhausted):
+        if budget > len(agent.available_actions()):
+            raise ValueError(f"budget {budget} exceeds the {len(agent.available_actions())} unused designs")
+    design_rng = agent.random_design_rng()
     snapshot()
     for _ in range(budget):
         if design == "random" and hasattr(agent.optimizer, "sample"):
-            action = agent.optimizer.sample(agent.rng)  # uniform in the design box
+            action = agent.optimizer.sample(design_rng)  # uniform in the design box
         elif design == "random":
             choices = agent.available_actions()
             if not choices or agent.optimizer is not None:
                 raise ValueError("random design requires a finite menu or a sampling optimizer")
-            action = choices[int(agent.rng.integers(len(choices)))]
+            action = choices[int(design_rng.integers(len(choices)))]
         else:
             action = agent.design()
         observation = environment.step(action)
@@ -167,7 +185,7 @@ def main():
                         help="UNSAFE: execute generated NumPyro Python with process privileges")
     parser.add_argument("--design", choices=["model", "joint", "task", "random"], default="model")
     parser.add_argument("--prediction", choices=["map", "bma"],
-                        help="default: bma for Boxing, map for other domains")
+                        help="default: bma for Boxing and GlucoseBench, map for other domains")
     parser.add_argument("--task-noise-variance", type=float, nargs="+")
     parser.add_argument("--no-m-open", action="store_true",
                         help="no expansion; for ChemBench also no LLM initialization (fixed nine laws)")
@@ -225,7 +243,7 @@ def main():
         from .glucose import GlucoseBenchEnvironment, make_agent as make_glucose_agent, run_glucose
         environment = GlucoseBenchEnvironment(args.world, replicate=args.replicate)
         agent = make_glucose_agent(environment, client, seed=args.seed, smoke=args.smoke,
-                                   experiment_budget=args.budget)
+                                   experiment_budget=args.budget, no_m_open=args.no_m_open)
         result = run_glucose(environment, agent, budget=args.budget, cuts=tuple(dict.fromkeys(args.cuts)),
                              design=args.design, prediction=args.prediction or "bma",
                              no_m_open=args.no_m_open, icl_client=client if args.icl else None)

@@ -12,6 +12,10 @@ Array = np.ndarray
 PredictFn = Callable[[Array, Any], Array]
 
 
+class NonFinitePrediction(ValueError):
+    """A model returned NaN or infinity at some parameter and action."""
+
+
 @runtime_checkable
 class Prior(Protocol):
     """Distribution over a model's flat parameter vector.
@@ -121,12 +125,12 @@ class CandidateModel:
     def observation_prediction(self, theta: Array, action: Any) -> Array:
         value = np.asarray(self.predict(np.asarray(theta, dtype=float), action), dtype=float)
         if np.any(~np.isfinite(value)):
-            raise ValueError(f"model {self.name!r} returned a non-finite prediction")
+            raise NonFinitePrediction(f"model {self.name!r} returned a non-finite prediction")
         return value
 
     def target_prediction(self, theta: Array, action: Any) -> Array:
         callback = self.predict_target or self.predict
         value = np.asarray(callback(np.asarray(theta, dtype=float), action), dtype=float)
         if np.any(~np.isfinite(value)):
-            raise ValueError(f"model {self.name!r} returned a non-finite target prediction")
+            raise NonFinitePrediction(f"model {self.name!r} returned a non-finite target prediction")
         return value

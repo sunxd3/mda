@@ -574,6 +574,8 @@ SEED_SPECS = (
 
 def _components(belief: BeliefState):
     for weight, fit in zip(belief.model_weights, belief.fits, strict=True):
+        if weight == 0.0:
+            continue
         ode = fit.model.metadata["ode"]
         theta = fit.parameters.map_parameters
         yield ode, theta[:ode.k], float(theta[ode.k]), float(theta[ode.k + 1]), float(weight)
@@ -591,14 +593,21 @@ def design_scores(belief: BeliefState, candidates: Sequence[GlucoseInputs],
         insulin_means.append(insulin[0][:, _INSULIN_FIT])
         stationary.append(sigma**2 / (1 - rho**2))
     scale_cgm = max(1.0, float(weights @ np.asarray(stationary)))
+    cgm_stack, insulin_stack = np.stack(cgm_means), np.stack(insulin_means)  # (models, candidates, times)
+    # A model whose rollout fails on a candidate drops out of that candidate's
+    # mixture, so one invalid low-weight model cannot void the whole score.
+    finite = np.all(np.isfinite(cgm_stack), axis=-1) & np.all(np.isfinite(insulin_stack), axis=-1)
+    mixture = weights[:, None] * finite
+    total = mixture.sum(axis=0)
+    mixture = np.divide(mixture, total, out=np.zeros_like(mixture), where=total > 0)
 
     def disagreement(means):
-        means = np.stack(means)  # (models, candidates, times)
-        centered = means - np.tensordot(weights, means, axes=(0, 0))
-        return np.tensordot(weights, centered**2, axes=(0, 0)).mean(axis=-1)
+        means = np.where(finite[..., None], means, 0.0)
+        centered = means - np.einsum("mc,mct->ct", mixture, means)
+        return np.einsum("mc,mct->c", mixture, centered**2) / means.shape[-1]
 
-    scores = 0.5 * (disagreement(cgm_means) / scale_cgm + disagreement(insulin_means) / ASSAY_SD**2)
-    return np.where(np.isfinite(scores), scores, -np.inf)
+    scores = 0.5 * (disagreement(cgm_stack) / scale_cgm + disagreement(insulin_stack) / ASSAY_SD**2)
+    return np.where(np.isfinite(scores) & (total > 0), scores, -np.inf)
 
 
 def _ekf_forecast(ode, theta, rho, sigma, constants, payload) -> tuple[np.ndarray, np.ndarray]:
@@ -703,10 +712,14 @@ class GlucoseForecaster:
         cut = int(payload["forecast_cut_min"])
         cgm_times = np.asarray(payload["requested_cgm_times_min"], dtype=float)
         insulin_times = np.asarray(payload["requested_insulin_times_min"], dtype=float)
-        cgm, insulin = np.zeros(73), np.zeros(25)
+        cgm, insulin, total = np.zeros(73), np.zeros(25), 0.0
         for ode, theta, rho, sigma, weight in self.components:
             c, i = _ekf_forecast(ode, theta, rho, sigma, self.constants, payload)
-            cgm, insulin = cgm + weight * c, insulin + weight * i
+            if np.all(np.isfinite(c)) and np.all(np.isfinite(i)):
+                cgm, insulin, total = cgm + weight * c, insulin + weight * i, total + weight
+        if total <= 0:
+            raise ValueError("every mixture component failed to forecast")
+        cgm, insulin = cgm / total, insulin / total
         if not np.array_equal(cgm_times, CGM_TIMES[CGM_TIMES > cut]):
             raise ValueError("unexpected requested CGM times")
         return {"cgm_mg_dl": cgm[CGM_TIMES > cut].tolist(),
@@ -904,16 +917,19 @@ class GlucoseBenchEnvironment:
 
 
 def make_agent(environment: GlucoseBenchEnvironment, client: Any, *, seed: int = 0, smoke: bool = False,
-               experiment_budget: int = 4) -> GlucoseAgent:
+               experiment_budget: int = 4, no_m_open: bool = False) -> GlucoseAgent:
     """The v5 glucose arm: four seed ODEs, BIC weights, at most two proposals
-    per call, an archive cap of 14, and one search round per update."""
+    per call, an archive cap of 14, and one search round per update.
+
+    ``no_m_open`` builds the agent without a proposer, so not even the
+    initialization gate can add LLM models."""
     if client is None and not smoke:
         raise ValueError("client=None is permitted only when smoke=True")
     if not 0 <= experiment_budget <= 4:
         raise ValueError("GlucoseBench allows at most four selected experiments")
     constants = GlucoseConstants()
     settings = GlucoseFitSettings(random_starts=0, max_iterations=15) if smoke else GlucoseFitSettings()
-    proposer = None if client is None else GlucoseProposer(client, constants)
+    proposer = None if client is None or no_m_open else GlucoseProposer(client, constants)
     return GlucoseAgent(
         menu=environment.menu, constants=constants, context=environment.context,
         initial_data=environment.initial_data,
@@ -957,10 +973,11 @@ def run_glucose(environment: GlucoseBenchEnvironment, agent: GlucoseAgent, *, bu
         agent.proposer = None
     snapshots = {len(agent.dataset): GlucoseForecaster.from_agent(agent, prediction)}
     history = [_record(agent)]
+    design_rng = agent.random_design_rng()
     for _ in range(budget):
         if design == "random":
             candidates = agent.candidate_actions()
-            action = candidates[int(agent.rng.integers(len(candidates)))]
+            action = candidates[int(design_rng.integers(len(candidates)))]
         else:
             action = agent.design()
         delivered, observation = environment.step(action)

@@ -15,6 +15,7 @@ import numpy as np
 
 from .numerics import weighted_covariance, weighted_mean
 from .posterior import BeliefState
+from .types import NonFinitePrediction
 
 
 def _flat(value: np.ndarray) -> np.ndarray:
@@ -75,13 +76,17 @@ def model_eig(
     moment-matched MI of Eq. migauss. Their scalar rankings agree, not their values.
     """
     model_means = []
-    for fit in belief.fits:
+    model_weights = []
+    for weight, fit in zip(belief.model_weights, belief.fits, strict=True):
+        if weight == 0.0:
+            continue
         predictions = np.stack(
             [_flat(fit.model.observation_prediction(theta, action)) for theta in fit.parameters.particles]
         )
         model_means.append(weighted_mean(predictions, fit.parameters.weights))
+        model_weights.append(weight)
     means = np.stack(model_means)
-    return _weighted_disagreement(means, belief.model_weights, observation_covariance)
+    return _weighted_disagreement(means, np.asarray(model_weights), observation_covariance)
 
 
 def joint_eig(
@@ -200,7 +205,11 @@ def value_of_information(
     }
     if flavour not in scorers:
         raise ValueError(f"unknown design flavour {flavour!r}")
-    return scorers[flavour](action)
+    try:
+        return scorers[flavour](action)
+    except (NonFinitePrediction, ArithmeticError):
+        # A weighted model that cannot predict this action makes it unusable.
+        return -np.inf
 
 
 def choose_design(

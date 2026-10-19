@@ -85,9 +85,12 @@ def test_designs_are_not_repeated_by_default():
     assert agent.design() == 1.0
 
 
-def test_duplicate_proposal_does_not_consume_expansion_budget():
+def test_duplicate_proposals_count_toward_the_expansion_cap():
     class DuplicateProposer:
+        calls = 0
+
         def propose(self, **kwargs):
+            DuplicateProposer.calls += 1
             return [constant_model()]
 
     agent = ModelDiscoveryAgent(
@@ -99,14 +102,16 @@ def test_duplicate_proposal_does_not_consume_expansion_budget():
         actions=[0.0, 1.0],
         observation_covariance=0.05**2,
         config=AgentConfig(
-            model_search_rounds=1,
+            model_search_rounds=2,
             expansion_cap=1,
             error_threshold=0.1,
             smc=SMCConfig(parameter_particles=16, rejuvenation_steps=0),
         ),
     )
     agent.update_state(1.0, np.asarray(2.0))
-    assert agent.expansion_count == 0
+    agent.update_state(0.5, np.asarray(3.0))
+    # v5 Algorithm 2: every call increments n_e, so N_e^max bounds LLM calls.
+    assert agent.expansion_count == DuplicateProposer.calls == 1
     assert len(agent.models) == 1
 
 

@@ -166,8 +166,9 @@ def test_agent_gate_failure_calls_proposer_and_rejects_invalid_births():
     assert system == g.GLUCOSE_PROPOSER_SYSTEM
     assert {m["model_id"] for m in sent["existing_models"]} >= {"two_stage_meal"}
     assert sent["observations"][0]["insulin_pmol_l"][1] is None
-    # An exact-expression duplicate and an unknown parent are both rejected.
-    assert agent.expansion_count == 0
+    # An exact-expression duplicate and an unknown parent are both rejected,
+    # but the call still counts toward the expansion cap.
+    assert agent.expansion_count == 1
     assert {m.name for m in agent.models} <= {spec.name for spec in g.SEED_SPECS}
     second = agent.design()
     assert second.key != first.key
@@ -192,6 +193,30 @@ def test_proposer_accepts_new_structures_with_valid_genealogy():
     assert [m.name for m in models] == ["two_stage_meal_2"]  # recombination needs two parents
     assert models[0].metadata["genealogy"]["origin"] == "edit"
     assert models[0].parameter_count == 9 + 2
+
+
+def test_proposer_drops_malformed_syntax_but_keeps_valid_siblings():
+    constants = g.GlucoseConstants(*CONSTANTS)
+    existing = [g.glucose_candidate(spec, constants) for spec in g.SEED_SPECS]
+    base = {**g.SEED_SPECS[0].to_dict(), "parent_ids": ["one_stage_linear_action"], "origin": "edit"}
+    broken = {**base, "name": "broken", "rhs": ["meal - q/p0", "insulin - i/p1", "p2*(gb*p3 - g"],
+              "edit_summary": "unbalanced parenthesis"}
+    valid = {**base, "name": "valid", "rhs": ["meal - q/p0", "insulin - i/p1", "p2*(gb - g) + p3*q - p4*i"],
+             "edit_summary": "drop the equilibrium multiplier"}
+    proposer = g.GlucoseProposer(FakeClient([broken, valid]), constants)
+    models = proposer.propose(context="", dataset=[], current_models=existing, residuals=(), count=2)
+    assert [m.name for m in models] == ["valid"]
+
+
+def test_forecaster_ignores_components_that_fail():
+    rng = np.random.default_rng(0)
+    datum = synthetic_episode(PROTOCOLS[0], "q", rng)
+    ode = g.GlucoseODE(g.SEED_SPECS[2])
+    good = (ode, TRUTH, 0.7, 3.0, 0.5)
+    failing = (ode, np.full(TRUTH.shape, np.nan), 0.7, 3.0, 0.5)
+    alone = g.GlucoseForecaster((good,), CONSTANTS)(payload(datum, 45))
+    mixed = g.GlucoseForecaster((good, failing), CONSTANTS)(payload(datum, 45))
+    np.testing.assert_allclose(mixed["cgm_mg_dl"], alone["cgm_mg_dl"])
 
 
 def test_icl_forecaster_retries_once_on_schema_errors():
@@ -230,3 +255,11 @@ def test_cli_rejects_invalid_glucose_requests(monkeypatch, tmp_path, extra):
     with pytest.raises(SystemExit) as error:
         main()
     assert error.value.code == 2
+
+
+def test_no_m_open_builds_the_agent_without_a_proposer():
+    environment = FakeEnvironment(np.random.default_rng(3))
+    client = FakeClient([])
+    agent = g.make_agent(environment, client, smoke=True, experiment_budget=2, no_m_open=True)
+    assert agent.proposer is None and agent.initial_gate_error is None
+    assert client.prompts == []
