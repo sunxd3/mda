@@ -76,3 +76,18 @@ def test_incomplete_response_is_not_cached(monkeypatch, tmp_path):
         "system", "prompt"
     ) == "ok"
     assert len(calls) == 2
+
+
+def test_luna_defaults_to_medium_effort_and_replay_never_loads_sdk(monkeypatch, tmp_path):
+    calls = _install_openai_stub(monkeypatch, [_completed('{"call": 1}')])
+    live = OpenAIJSONClient(model="gpt-5.6-luna", api_key="stub", cache_dir=tmp_path)
+    assert live.ask("system", "prompt") == '{"call": 1}'
+    assert calls[0]["reasoning"] == {"effort": "medium"}
+    assert "temperature" not in calls[0]
+
+    monkeypatch.delitem(sys.modules, "openai")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    replay = OpenAIJSONClient(model="gpt-5.6-luna", cache_dir=tmp_path, replay_only=True)
+    assert replay.ask("system", "prompt") == '{"call": 1}'
+    with pytest.raises(RuntimeError, match="replay cache miss"):
+        replay.ask("system", "other prompt")

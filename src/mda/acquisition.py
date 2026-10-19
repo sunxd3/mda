@@ -1,4 +1,10 @@
-"""Gaussian model-EIG, joint-EIG, and task-VoI surrogates (Algorithm 9)."""
+"""Model-EIG and joint-EIG design surrogates (v5 ``VoI``) plus task-VoI extensions.
+
+v5 uses the model-disagreement surrogate (Eq. voi) by default and the joint
+variant (Eq. voiFull) as an alternative. It leaves task-aware VoI to future
+work; the two task flavours here implement v4's coordinatewise objective and
+a Gaussian alternative, and are not part of the v5 method.
+"""
 
 from __future__ import annotations
 
@@ -63,10 +69,10 @@ def model_eig(
     belief: BeliefState,
     observation_covariance: float | np.ndarray,
 ) -> float:
-    """Paper Eq. 34: between-structure predictive disagreement.
+    """v5 Eq. voi: weighted between-structure predictive disagreement.
 
     This is the trace surrogate used by the experiments, not the log-determinant
-    moment-matched MI of Eq. 31. Their scalar rankings agree, not their values.
+    moment-matched MI of Eq. migauss. Their scalar rankings agree, not their values.
     """
     model_means = []
     for fit in belief.fits:
@@ -83,7 +89,7 @@ def joint_eig(
     belief: BeliefState,
     observation_covariance: float | np.ndarray,
 ) -> float:
-    """Paper Eq. 38: model plus within-structure parameter disagreement."""
+    """v5 Eq. voiFull: model plus within-structure parameter disagreement."""
     predictions = []
     weights = []
     for model, theta, weight in belief.iter_parameter_particles():
@@ -101,12 +107,12 @@ def task_value_of_information(
     observation_covariance: float | np.ndarray,
     target_covariance: float | np.ndarray | None = None,
 ) -> float:
-    """Eq. 43: target-to-target covariance, summed coordinatewise after whitening.
+    """v4 Eq. 43: target-to-target covariance, summed coordinatewise after whitening.
 
     Here ``observation_covariance`` is noise in *target* space, not raw trace
     space. It and the optional loss scale ``target_covariance`` must be scalar
     or diagonal. By default the noise variances also whiten the loss, as in the
-    prose after Eq. 45. Query targets must have the same coordinates as the
+    prose after v4 Eq. 45. Query targets must have the same coordinates as the
     target at the proposed action. No cross-coordinate conditioning is used.
     """
     particles = list(belief.iter_parameter_particles())

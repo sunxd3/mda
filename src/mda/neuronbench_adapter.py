@@ -1,4 +1,9 @@
-"""Deterministic NeuronBench adapter using the paper's data and proposal contracts.
+"""Deterministic NeuronBench adapter using the v4 paper's data and proposal contracts.
+
+v5 drops the deterministic benchmark (its ODE is only a model arm fitted to
+stochastic data), so ``NeuronBenchEnvironment`` and its Table 14 noise model,
+Eq. 1 metric, and brief/long-step D0 are v4 legacy. The proposer and channel
+candidates are shared with the stochastic adapter.
 
 The released benchmark remains the source of truth for protocols and HH simulation.
 This module supplies the missing agent/environment glue without reading its private
@@ -257,7 +262,7 @@ def evaluate_neuron_recovery(world_name: str, model: CandidateModel, parameters:
 
 
 class NeuronBenchEnvironment:
-    """Algorithm 1 environment facade with the paper's fixed two-protocol D0."""
+    """v4 Algorithm 1 environment facade with its fixed brief/long-step D0."""
 
     def __init__(self, world_name: str, *, seed: int = 0) -> None:
         nb = _neuronbench()
@@ -291,7 +296,7 @@ class NeuronBenchEnvironment:
         return np.maximum(0.12 * np.abs(prediction), 3.0)
 
     def evaluate_predictor(self, predictor) -> float:
-        """Evaluate Eq. 1 on held-out queries, separately from training data."""
+        """Evaluate v4 Eq. 1 on held-out queries, separately from training data."""
         truth = np.stack([
             trace_features(self.world.run(action).voltage, action)
             for action in self.query_actions

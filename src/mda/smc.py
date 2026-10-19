@@ -1,4 +1,4 @@
-"""Adaptive likelihood-tempered SMC over model parameters (Algorithm 5)."""
+"""Adaptive likelihood-tempered SMC over model parameters (``marglik-smc``)."""
 
 from __future__ import annotations
 
@@ -120,7 +120,8 @@ def parameter_posterior(
     """Fit one structure and estimate its marginal likelihood.
 
     Proposals outside the uniform-prior support are rejected rather than clipped;
-    this preserves the symmetric random-walk acceptance ratio printed in Algorithm 5.
+    this preserves the symmetric random-walk acceptance ratio of the paper's
+    algorithm (v5 notes that the authors' NumPy fitter clipped instead).
     If ``max_temperatures`` is reached, the final rung always advances fully to
     beta=1 rather than returning a silently partial posterior.  The diagnostics
     report when that forced step falls below the requested ESS target.

@@ -7,6 +7,7 @@ import json
 from typing import Any
 
 from mda.agent import AgentConfig, ModelDiscoveryAgent
+from mda.evidence import RecursiveEvidence, TemperedSMCEvidence
 from mda.likelihoods import BootstrapParticleFilter, DeterministicGaussianLikelihood
 from mda.neuron_stochastic import (
     StochasticNeuronBenchEnvironment,
@@ -53,8 +54,13 @@ def make_agent(
     smoke: bool = False,
     experiment_budget: int = 6,
 ) -> ModelDiscoveryAgent:
-    """Construct the Appendix H.4 NeuronBench reproduction agent.
+    """Construct the NeuronBench reproduction agent.
 
+    The stochastic environment follows v5's SDE+SMC arm: a 128-particle
+    bootstrap PF, a 128-particle tempered-SMC fit with 16 initialization rungs,
+    then recursive weight/evidence updates without rejuvenation, an archive of
+    the plain Na/K/leak cell plus three LLM proposals, and ``p(m) ~ exp(-2k)``.
+    The deterministic environment keeps the v4 (Appendix H.4) configuration.
     Smoke mode preserves the same model and data contracts while sharply
     reducing numerical work; it is not suitable for benchmark reporting.
     """
@@ -81,13 +87,15 @@ def make_agent(
             prediction_rollouts=prediction_rollouts,
             seed=seed,
         )
-        likelihood = BootstrapParticleFilter(3 if smoke else 250, 2.0)
+        likelihood = BootstrapParticleFilter(3 if smoke else 128, 2.0)
         observation_covariance = 2.0**2
+        initial_proposals = 3
     else:
         proposer = proposal
         baseline = reference_neuron_candidate()
         likelihood = DeterministicGaussianLikelihood(environment.observation_std)
         observation_covariance = 3.0**2
+        initial_proposals = 4
 
     config = AgentConfig(
         model_cap=5,
@@ -98,19 +106,20 @@ def make_agent(
         occam_penalty=2.0,
         predictive_floor=2.0 if stochastic else 3.0,
         smc=SMCConfig(
-            parameter_particles=2 if smoke else 200,
+            parameter_particles=2 if smoke else (128 if stochastic else 200),
             rejuvenation_steps=0 if smoke else 3,
             target_ess_fraction=0.5,
-            max_temperatures=3 if smoke else 80,
+            max_temperatures=3 if smoke else (16 if stochastic else 80),
         ),
     )
+    evidence = RecursiveEvidence(TemperedSMCEvidence(config.smc)) if stochastic else None
     queries = environment.query_actions[:1] if smoke else environment.query_actions
     models = [baseline]
     if proposer is not None:
         models.extend(proposer.propose(
             context=f"{environment.context}\nExperiment budget remaining: {experiment_budget}.\nCurrent phase: explore.",
             dataset=environment.initial_data, current_models=models, residuals=(),
-            count=config.model_cap - 1,
+            count=initial_proposals,
         ))
     return ModelDiscoveryAgent(
         context=environment.context,
@@ -125,6 +134,7 @@ def make_agent(
         query_actions=queries,
         experiment_budget=experiment_budget,
         action_key=environment.action_key,
+        evidence=evidence,
         seed=seed,
     )
 

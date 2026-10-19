@@ -1,10 +1,16 @@
-"""Fox--Lu stochastic NeuronBench candidate and environment (benchmark v4).
+"""Fox--Lu stochastic NeuronBench candidate and environment.
 
 The one-step equations below intentionally mirror NeuronBench commit
 ``c354622``.  Unlike ``neuronbench.stochastic.run_particles``, they expose and
 carry voltage and every gate so that a bootstrap filter can resample the latent
 cell between observations.  The only numerical extension is the candidate's
 sampled slow-Na depolarized tau; recovery remains the benchmark's 1500 ms.
+
+The environment follows the v5 paper ("HHbench") where the pinned package
+allows it: the brief/weak-step D0 and the fixed-scale feature metric. v5's
+90-protocol menu, 20 stratified voltage samples per experiment, and shared
+24-query set are not released, so the pinned package's protocol pool, ~4 ms
+observation grid, and per-world held-out protocols are used instead.
 """
 
 from __future__ import annotations
@@ -21,6 +27,10 @@ from .neuronbench_adapter import (
     reference_neuron_candidate,
 )
 from .types import CandidateModel, Datum, StateSpaceModel
+
+
+# v5 Eq. hhFixedScaleMSE scales for [n_test, n_pre, run_down, adaptation, V_min, V_end].
+FEATURE_SCALES = np.array([3.0, 3.0, 3.0, 3.0, 12.0, 8.0])
 
 
 def _protocol(protocol):
@@ -206,20 +216,17 @@ class StochasticNeuronBenchEnvironment:
             "A noisy single-compartment Hodgkin-Huxley neuron may contain a novel "
             "membrane mechanism. " + self.world.text_prior
         )
-        # Appendix H.4 fixes D0 by protocol identity, not by the incidental
-        # ordering of the upstream design menu.
+        # v5 fixes D0 by protocol identity (a brief 12 uA/40 ms and a weak
+        # 5 uA/120 ms step), not by the ordering of the upstream design menu.
         wanted = {
             "brief step (12 uA, 40 ms)",
-            "long step (10 uA, 300 ms)",
+            "weak step (5 uA, 120 ms)",
         }
         by_label = {protocol[0]: protocol for protocol in self.world.protocol_pool}
         missing = wanted.difference(by_label)
         if missing:
             raise RuntimeError(f"NeuronBench is missing the paper D0 protocols: {sorted(missing)}")
-        self.initial_protocols = [
-            by_label["brief step (12 uA, 40 ms)"],
-            by_label["long step (10 uA, 300 ms)"],
-        ]
+        self.initial_protocols = [by_label[label] for label in sorted(wanted)]
         self.initial_data = [
             Datum(p, self.world.run(p).voltage) for p in self.initial_protocols
         ]
@@ -244,6 +251,12 @@ class StochasticNeuronBenchEnvironment:
         return evaluate_neuron_recovery(self.world_name, model, parameters)
 
     def evaluate_predictor(self, predictor) -> float:
+        """v5 Eq. hhFixedScaleMSE: mean squared feature error over fixed scales.
+
+        Scales are s = (3, 3, 3, 3, 12, 8) for the six features; references are
+        expected features from 200 independent oracle rollouts (v5 gives no
+        count; 200 is the pinned evaluator's default).
+        """
         nb = _neuronbench()
         targets = nb.evaluator.held_out_feature_targets(
             self.world_name,
@@ -258,8 +271,4 @@ class StochasticNeuronBenchEnvironment:
         )
         if forecast.shape != truth.shape:
             raise ValueError("predictor features must match held-out feature shape")
-        query_variance = np.var(truth, axis=0)
-        if np.any(query_variance == 0):
-            raise ValueError("Eq. 1 is undefined for zero query variance")
-        component_mse = np.mean((forecast - truth) ** 2, axis=0)
-        return float(np.mean(component_mse / query_variance))
+        return float(np.mean(((forecast - truth) / FEATURE_SCALES) ** 2))

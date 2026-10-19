@@ -1,4 +1,4 @@
-"""Algorithm 3 and 4 likelihood implementations."""
+"""Trajectory likelihoods: deterministic Gaussian, bootstrap PF, and BSL."""
 
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ def _normal_logpdf(observed: np.ndarray, mean: np.ndarray, std: float | np.ndarr
 
 @dataclass(frozen=True)
 class DeterministicGaussianLikelihood:
-    """Exact likelihood for deterministic latent dynamics (paper Algorithm 3)."""
+    """Exact likelihood for deterministic latent dynamics (``loglik-det``)."""
 
     observation_std: float | np.ndarray | NoiseFn
 
@@ -55,14 +55,96 @@ class DeterministicGaussianLikelihood:
         return total if np.isfinite(total) else -np.inf
 
 
+def _simulate_traces(model, theta, datum, count, std, rng) -> np.ndarray:
+    """Draw ``count`` noisy trajectories with the datum's shape from the SSM."""
+    observations = np.asarray(datum.observation, dtype=float)
+    shape = observations.shape if observations.ndim == 2 else (len(observations), 1)
+    state_model = model.state_space
+    states = np.asarray(state_model.initial_state(theta, datum.action, count, rng), dtype=float)
+    traces = np.empty((count, *shape))
+    for time_index in range(shape[0]):
+        states = np.asarray(
+            state_model.transition(states, theta, datum.action, time_index, rng), dtype=float
+        )
+        means = np.asarray(
+            state_model.observation_mean(states, theta, datum.action, time_index), dtype=float
+        ).reshape(count, shape[1])
+        traces[:, time_index] = means + rng.normal(0.0, 1.0, means.shape) * std
+    return traces if observations.ndim == 2 else traces[..., 0]
+
+
+@dataclass(frozen=True)
+class BayesianSyntheticLikelihood:
+    """Gaussian synthetic log-likelihood of experiment summaries (v5 ``loglik-bsl``).
+
+    For each experiment, ``simulations`` noisy trajectories are drawn from the
+    model's state-space callbacks, reduced by ``summary(trace, action)``, and
+    the observed summary is scored under a Gaussian with the simulated mean and
+    covariance ``(1-shrinkage) S + shrinkage diag(S) + ridge I``. This is a
+    density of summaries, not of raw trajectories.
+    """
+
+    summary: Callable[[np.ndarray, object], np.ndarray]
+    simulations: int
+    observation_std: float | np.ndarray
+    shrinkage: float = 0.0
+    ridge: float = 1e-6
+
+    def __post_init__(self) -> None:
+        if self.simulations < 2:
+            raise ValueError("BSL needs at least two simulations per experiment")
+        if not 0 <= self.shrinkage <= 1 or self.ridge <= 0:
+            raise ValueError("shrinkage must be in [0, 1] and ridge positive")
+
+    def __call__(
+        self,
+        dataset: Sequence[Datum],
+        model: CandidateModel,
+        theta: np.ndarray,
+        rng: np.random.Generator,
+    ) -> float:
+        if model.state_space is None:
+            raise ValueError(f"model {model.name!r} has no state-space callbacks")
+        std = np.asarray(self.observation_std, dtype=float)
+        if np.any(~np.isfinite(std)) or np.any(std <= 0):
+            raise ValueError("observation standard deviations must be finite and positive")
+        total = 0.0
+        try:
+            for datum in dataset:
+                traces = _simulate_traces(model, theta, datum, self.simulations, std, rng)
+                summaries = np.stack([
+                    np.asarray(self.summary(trace, datum.action), dtype=float).reshape(-1)
+                    for trace in traces
+                ])
+                observed = np.asarray(self.summary(datum.observation, datum.action), dtype=float)
+                observed = observed.reshape(-1)
+                mean = summaries.mean(axis=0)
+                sample = np.atleast_2d(np.cov(summaries, rowvar=False, ddof=1))
+                covariance = (
+                    (1 - self.shrinkage) * sample
+                    + self.shrinkage * np.diag(np.diag(sample))
+                    + self.ridge * np.eye(len(mean))
+                )
+                cholesky = np.linalg.cholesky(covariance)
+                whitened = np.linalg.solve(cholesky, observed - mean)
+                total += -0.5 * float(
+                    whitened @ whitened
+                    + 2 * np.sum(np.log(np.diag(cholesky)))
+                    + len(mean) * np.log(2 * np.pi)
+                )
+        except (FloatingPointError, OverflowError, ValueError, np.linalg.LinAlgError):
+            return -np.inf
+        return total if np.isfinite(total) else -np.inf
+
+
 @dataclass(frozen=True)
 class BootstrapParticleFilter:
-    """Bootstrap PF estimate of an intractable state-space likelihood (Algorithm 4).
+    """Bootstrap PF estimate of an intractable state-space likelihood (``loglik-pf``).
 
     The returned *likelihood* estimate is unbiased under ordinary bootstrap
     resampling. Its logarithm is not. When nested inside likelihood-tempered SMC,
-    fractional powers are therefore approximate pseudo-marginal targets, exactly
-    as acknowledged in footnote 10 of the paper.
+    fractional powers are therefore approximate pseudo-marginal targets, as the
+    paper acknowledges in its tempered-SMC appendix.
     """
 
     latent_particles: int

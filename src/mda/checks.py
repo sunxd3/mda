@@ -1,4 +1,4 @@
-"""Target-space residual checks used to trigger M-open expansion (Algorithm 8)."""
+"""Target-space residual checks used to trigger M-open expansion (``predictive-check``)."""
 
 from __future__ import annotations
 

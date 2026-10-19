@@ -1,4 +1,4 @@
-"""Model Discovery Agent: LLM proposals, SMC³ inference, and Bayesian design."""
+"""Model Discovery Agent: LLM proposals, approximate Bayesian inference, and design."""
 
 from .acquisition import (
     full_observation_task_value_of_information,
@@ -6,7 +6,10 @@ from .acquisition import (
 )
 from .agent import AgentConfig, ModelDiscoveryAgent
 from .expressions import SymbolicRegressionProposer, compile_expression
-from .likelihoods import BootstrapParticleFilter, DeterministicGaussianLikelihood
+from .evidence import BICEvidence, RecursiveEvidence, TemperedSMCEvidence
+from .likelihoods import (
+    BayesianSyntheticLikelihood, BootstrapParticleFilter, DeterministicGaussianLikelihood,
+)
 from .neuronbench_adapter import NeuronBenchEnvironment, NeuronBenchProposer, NeuronHypothesis
 from .openai_client import OpenAIJSONClient
 from .optimizers import CMAESOptimizer
@@ -17,6 +20,8 @@ from .types import CandidateModel, Datum, StateSpaceModel, UniformPrior
 
 __all__ = [
     "AgentConfig",
+    "BICEvidence",
+    "BayesianSyntheticLikelihood",
     "BeliefState",
     "BootstrapParticleFilter",
     "CMAESOptimizer",
@@ -30,9 +35,11 @@ __all__ = [
     "NeuronBenchProposer",
     "NeuronHypothesis",
     "OpenAIJSONClient",
+    "RecursiveEvidence",
     "SMCConfig",
     "StateSpaceModel",
     "SymbolicRegressionProposer",
+    "TemperedSMCEvidence",
     "UniformPrior",
     "compile_expression",
     "fit_model_posterior",

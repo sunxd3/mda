@@ -64,6 +64,10 @@ class CMAESOptimizer:
             )
         return value
 
+    def sample(self, rng: np.random.Generator) -> Any:
+        """Draw a uniform design in the normalized (log-mapped) box."""
+        return self.decode(self._domain_vector(rng.random(self.lower.size)))
+
     def __call__(self, score: Callable[[Any], float], rng: np.random.Generator) -> Any:
         """Return the best finite-scoring action actually evaluated."""
         try:

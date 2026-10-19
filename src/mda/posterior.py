@@ -1,7 +1,8 @@
-"""Model-level evidence weighting and support pruning (Algorithm 6)."""
+"""Model-level evidence weighting and support pruning (``model-posterior``)."""
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Iterator, Sequence
 
@@ -75,8 +76,16 @@ def fit_model_posterior(
     model_cap: int,
     occam_penalty: float,
     rng: np.random.Generator,
+    evidence: Callable[..., ParameterPosterior] | None = None,
+    reuse: Mapping[str, ParameterPosterior] | None = None,
 ) -> BeliefState:
-    """Full-batch evidence refit followed by deterministic top-N support control."""
+    """Evidence refit followed by deterministic top-N support control.
+
+    ``evidence`` maps ``(dataset, model, likelihood, rng)`` to a parameter
+    posterior (tempered SMC with ``smc_config`` when omitted). ``reuse`` holds
+    posteriors already computed on exactly this dataset, keyed by model key;
+    those structures are not refitted.
+    """
     if model_cap < 1:
         raise ValueError("model_cap must be positive")
     if occam_penalty < 0:
@@ -86,8 +95,14 @@ def fit_model_posterior(
         raise ValueError("at least one candidate model is required")
 
     fits = []
+    reuse = reuse or {}
     for model in candidates:
-        posterior = parameter_posterior(dataset, model, likelihood, smc_config, rng)
+        if model.key in reuse:
+            posterior = reuse[model.key]
+        elif evidence is None:
+            posterior = parameter_posterior(dataset, model, likelihood, smc_config, rng)
+        else:
+            posterior = evidence(dataset, model, likelihood, rng)
         score = posterior.log_evidence - occam_penalty * model.parameter_count
         fits.append(ModelFit(model=model, parameters=posterior, log_score=score))
     scores = np.array([fit.log_score for fit in fits])

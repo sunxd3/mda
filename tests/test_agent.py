@@ -238,14 +238,19 @@ def test_adaptive_pool_requires_both_gates_and_reopens_on_fresh_failure():
                                smc=SMCConfig(parameter_particles=1, rejuvenation_steps=0)),
         )
 
-    confident = make(1.0)
+    def updated(agent, observation=1.0):
+        agent.update_state(1.0, np.asarray(observation))
+        return agent
+
+    unadapted = make(1.0)
+    assert unadapted.active_model_cap == 3  # no shrinkage at initialization
+    confident = updated(make(1.0))
     assert confident.active_model_cap == 2
-    assert len(confident.models) == 2
-    assert confident.belief.discarded_mass > 0
+    assert [model.name for model in confident.models] == ["one", "two"]
     # Confident but poor fit must not shrink; nor may good fit without confidence.
-    assert make(10.0).active_model_cap == 3
-    assert make(1.0, confidence=0.99).active_model_cap == 3
-    confident.update_state(1.0, np.asarray(3.0))
+    assert updated(make(10.0), 10.0).active_model_cap == 3
+    assert updated(make(1.0, confidence=0.999)).active_model_cap == 3  # MAP weight ~0.998
+    confident.update_state(2.0, np.asarray(3.0))
     assert confident.active_model_cap == 3
     assert len(confident.models) == 3  # expansion used reopened cap before the refit
 
