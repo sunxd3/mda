@@ -14,7 +14,7 @@ import numpy as np
 
 def build(domain, world, client, *, seed, smoke, budget, stochastic=False,
           difficulty="medium", allow_code_execution=False, method="mda",
-          inference=None, llm_initialization=True):
+          inference=None, llm_initialization=True, online_expansion=False):
     if method not in {"mda", "apprentice"} or (method == "apprentice" and domain != "boxing"):
         raise ValueError("apprentice is supported only for Boxing")
     if domain == "boxing":
@@ -41,7 +41,7 @@ def build(domain, world, client, *, seed, smoke, budget, stochastic=False,
         from mda.neuron_stochastic import StochasticNeuronBenchEnvironment
         factory = StochasticNeuronBenchEnvironment if stochastic else NeuronBenchEnvironment
         environment = factory(world, seed=seed)
-        extra = {}
+        extra = {"online_expansion": online_expansion}
     else:
         raise ValueError(f"unknown domain {domain!r}")
     if inference is not None and domain != "chemistry":
@@ -171,6 +171,8 @@ def main():
     parser.add_argument("--task-noise-variance", type=float, nargs="+")
     parser.add_argument("--no-m-open", action="store_true",
                         help="no expansion; for ChemBench also no LLM initialization (fixed nine laws)")
+    parser.add_argument("--online-expansion", action="store_true",
+                        help="stochastic neuron: allow model births after initialization (v5 freezes the archive)")
     parser.add_argument("--icl", action="store_true", help="also forecast using only the collected data")
     parser.add_argument("--recovery", action="store_true", help="symbolic-law or coarse neuron-class recovery diagnostic")
     parser.add_argument("--cuts", type=int, nargs="+", default=[45],
@@ -186,6 +188,8 @@ def main():
         parser.error("output already exists; choose another path")
     if args.stochastic and args.domain != "neuron":
         parser.error("--stochastic applies only to neuron")
+    if args.online_expansion and (not args.stochastic or args.no_m_open):
+        parser.error("--online-expansion applies only to stochastic neuron runs without --no-m-open")
     if args.domain == "neuron" and args.design == "task" and args.task_noise_variance is None:
         parser.error("neuron task VoI requires --task-noise-variance in feature-space units")
     if args.task_noise_variance is not None and (
@@ -231,7 +235,8 @@ def main():
     environment, agent = build(args.domain, args.world, client, seed=args.seed,
         smoke=args.smoke, budget=args.budget, stochastic=args.stochastic,
         difficulty=args.difficulty, allow_code_execution=args.allow_code_execution, method=args.agent,
-        inference=args.inference, llm_initialization=not fixed_library)
+        inference=args.inference, llm_initialization=not fixed_library,
+        online_expansion=args.online_expansion)
     if args.task_noise_variance is not None:
         agent.task_noise_covariance = (args.task_noise_variance[0] if len(args.task_noise_variance) == 1
                                        else np.asarray(args.task_noise_variance))

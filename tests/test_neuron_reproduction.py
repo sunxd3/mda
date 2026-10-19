@@ -38,6 +38,14 @@ def test_stochastic_d0_is_fixed_and_smoke_is_cheap():
     assert isinstance(agent.evidence, RecursiveEvidence)
 
 
+def test_stochastic_archive_is_frozen_unless_online_expansion_is_requested():
+    environment = StochasticNeuronBenchEnvironment("ca_rebound", seed=3)
+    assert make_agent(environment, None, smoke=True).config.expansion_cap == 0
+    assert make_agent(environment, None, smoke=True, online_expansion=True).config.expansion_cap == 3
+    with pytest.raises(ValueError, match="stochastic"):
+        make_agent(NeuronBenchEnvironment("ca_rebound", seed=3), None, smoke=True, online_expansion=True)
+
+
 def test_stochastic_proposer_preserves_hypothesis_metadata():
     spec = NeuronHypothesis(
         "test channel", "channel", -77.0, "depol", True, 8.0, 2,

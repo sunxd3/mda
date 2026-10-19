@@ -39,6 +39,16 @@ def test_cli_requires_explicit_execution_mode(monkeypatch, tmp_path):
     assert error.value.code == 2
 
 
+@pytest.mark.parametrize("extra", [[], ["--stochastic", "--no-m-open"]])
+def test_cli_rejects_online_expansion_outside_open_stochastic_neuron(monkeypatch, tmp_path, extra):
+    monkeypatch.setattr("sys.argv", ["mda-reproduce", "neuron", "--world", "ca_rebound", "--smoke",
+                                     "--online-expansion", *extra,
+                                     "--output", str(tmp_path / "result.json")])
+    with pytest.raises(SystemExit) as error:
+        main()
+    assert error.value.code == 2
+
+
 def test_smoke_cli_writes_result(monkeypatch, tmp_path):
     path = tmp_path / "result.json"
     monkeypatch.setattr("sys.argv", ["mda-reproduce", "boxing", "--world", "hyperbolic",

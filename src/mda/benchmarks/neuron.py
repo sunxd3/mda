@@ -53,6 +53,7 @@ def make_agent(
     seed: int = 0,
     smoke: bool = False,
     experiment_budget: int = 6,
+    online_expansion: bool = False,
 ) -> ModelDiscoveryAgent:
     """Construct the NeuronBench reproduction agent.
 
@@ -60,13 +61,19 @@ def make_agent(
     bootstrap PF, a 128-particle tempered-SMC fit with 16 initialization rungs,
     then recursive weight/evidence updates without rejuvenation, an archive of
     the plain Na/K/leak cell plus three LLM proposals, and ``p(m) ~ exp(-2k)``.
-    The deterministic environment keeps the v4 (Appendix H.4) configuration.
+    As in v5's headline cohort, later model births are disabled, so the LLM
+    only builds the initial archive. ``online_expansion=True`` re-enables
+    v4's residual-triggered expansion; it is not v5's stochastic rank-test gate.
+    The deterministic environment keeps the v4 (Appendix H.4) configuration,
+    including online expansion.
     Smoke mode preserves the same model and data contracts while sharply
     reducing numerical work; it is not suitable for benchmark reporting.
     """
     if client is None and not smoke:
         raise ValueError("client=None is permitted only when smoke=True")
     stochastic = isinstance(environment, StochasticNeuronBenchEnvironment)
+    if online_expansion and not stochastic:
+        raise ValueError("online_expansion applies only to the stochastic environment")
     feature_fn = stochastic_trace_features if stochastic else trace_features
     proposal = None if client is None else NeuronBenchProposer(client, feature_fn=feature_fn)
     prediction_rollouts = 2 if smoke else 200
@@ -101,7 +108,7 @@ def make_agent(
         model_cap=5,
         new_models_per_expansion=1,
         model_search_rounds=2,
-        expansion_cap=3,
+        expansion_cap=0 if stochastic and not online_expansion else 3,
         error_threshold=0.18,
         occam_penalty=2.0,
         predictive_floor=2.0 if stochastic else 3.0,
