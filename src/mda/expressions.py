@@ -63,6 +63,60 @@ _ALLOWED_NODES = (
 )
 
 
+def _validate_tree(tree: ast.AST, allowed_names: set[str], functions: Mapping[str, Any]) -> None:
+    for node in ast.walk(tree):
+        if not isinstance(node, _ALLOWED_NODES):
+            raise ValueError(f"unsupported expression syntax: {type(node).__name__}")
+        if isinstance(node, ast.Name) and node.id not in allowed_names:
+            raise ValueError(f"undeclared name {node.id!r}")
+        if isinstance(node, ast.Call):
+            if not isinstance(node.func, ast.Name) or node.func.id not in functions:
+                raise ValueError("only approved numerical functions may be called")
+            if node.keywords:
+                raise ValueError("keyword arguments are not allowed in expressions")
+        if isinstance(node, ast.Constant) and (
+            isinstance(node.value, bool) or not isinstance(node.value, (int, float))
+        ):
+            raise ValueError("only numerical constants are allowed")
+
+
+def compile_expressions(
+    expressions: Sequence[str],
+    names: Sequence[str],
+    functions: Sequence[str] | None = None,
+):
+    """Compile whitelisted expressions into one evaluator of a name mapping.
+
+    The evaluator takes ``{name: array}`` and returns a tuple of arrays, one per
+    expression, broadcast by NumPy. Floating-point errors are not raised; the
+    caller checks finiteness. ``functions`` restricts the callable subset.
+    """
+    names = tuple(names)
+    allowed = dict(_FUNCTIONS) if functions is None else {name: _FUNCTIONS[name] for name in functions}
+    if any(not name.isidentifier() or keyword.iskeyword(name) for name in names):
+        raise ValueError("names must be valid Python identifiers")
+    if len(set(names)) != len(names) or set(names) & (set(_FUNCTIONS) | {"pi", "e"}):
+        raise ValueError("names must be unique and cannot shadow functions or constants")
+    if not expressions:
+        raise ValueError("at least one expression is required")
+    trees = []
+    for expression in expressions:
+        if not isinstance(expression, str) or not expression.strip():
+            raise ValueError("expressions must be nonempty strings")
+        tree = ast.parse(expression.strip(), mode="eval")
+        _validate_tree(tree, set(names) | set(allowed) | {"pi", "e"}, allowed)
+        trees.append(tree.body)
+    code = compile(ast.Expression(ast.fix_missing_locations(ast.Tuple(trees, ast.Load()))),
+                   "<mda-expressions>", "eval")
+
+    def evaluate(values: Mapping[str, Any]) -> tuple[np.ndarray, ...]:
+        environment = {**allowed, "pi": np.pi, "e": np.e, **values}
+        with np.errstate(all="ignore"):
+            return tuple(np.asarray(value, dtype=float) for value in eval(code, {"__builtins__": {}}, environment))
+
+    return evaluate
+
+
 def compile_expression(
     expression: str,
     variable_names: Sequence[str],
@@ -84,19 +138,7 @@ def compile_expression(
         raise ValueError("variable and parameter names cannot shadow functions or constants")
 
     tree = ast.parse(expression, mode="eval")
-    allowed_names = set(declared) | reserved
-    for node in ast.walk(tree):
-        if not isinstance(node, _ALLOWED_NODES):
-            raise ValueError(f"unsupported expression syntax: {type(node).__name__}")
-        if isinstance(node, ast.Name) and node.id not in allowed_names:
-            raise ValueError(f"undeclared name {node.id!r}")
-        if isinstance(node, ast.Call):
-            if not isinstance(node.func, ast.Name) or node.func.id not in _FUNCTIONS:
-                raise ValueError("only approved numerical functions may be called")
-            if node.keywords:
-                raise ValueError("keyword arguments are not allowed in expressions")
-        if isinstance(node, ast.Constant) and not isinstance(node.value, (int, float)):
-            raise ValueError("only numerical constants are allowed")
+    _validate_tree(tree, set(declared) | reserved, _FUNCTIONS)
     code = compile(tree, "<mda-expression>", "eval")
 
     def evaluate(theta: np.ndarray, action: Any) -> np.ndarray:

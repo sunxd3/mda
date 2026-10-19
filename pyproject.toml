@@ -26,10 +26,14 @@ recovery = ["scipy>=1.11", "sympy>=1.12"]
 neuron = [
     "neuronbench @ git+https://github.com/murphyk/neuronbench.git@c354622458c460b419cab821d482c879f0578377",
 ]
+glucose = [
+    "glucosebench @ git+https://github.com/murphyk/glucosebench.git@6bb0ff6f44513e1e816ac3f0827531a366e8d7a0",
+    "scipy>=1.11",
+]
 baselines = ["neurobench>=2.3.0"]
 dev = [
     "pytest>=8.0",
-    "model-discovery-agent[bic,design,llm,neuron,numpyro,recovery]",
+    "model-discovery-agent[bic,design,glucose,llm,neuron,numpyro,recovery]",
 ]
 
 [project.scripts]

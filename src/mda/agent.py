@@ -83,10 +83,12 @@ class ModelDiscoveryAgent:
         experiment_budget: int | None = None,
         action_key: Callable[[Any], str] = repr,
         evidence: EvidenceBackend | None = None,
+        check: Callable[[BeliefState, Datum, Sequence[Datum]], float] | None = None,
         seed: int = 0,
     ) -> None:
         self.context = context
         self.evidence = evidence
+        self.check = check
         self.dataset = list(initial_data)
         self.likelihood = likelihood
         self.actions = list(actions)
@@ -243,14 +245,7 @@ class ModelDiscoveryAgent:
         later. The returned value is always the prequential error.
         """
         fresh = Datum(action, observation)
-        error = predictive_check(
-            self.belief,
-            fresh,
-            self.dataset,
-            target=self.target,
-            floor=self.config.predictive_floor,
-            backtest=self.config.backtest,
-        )
+        error = self._check(fresh)
         self.last_predictive_error = error
         gate_error = error if self.config.expansion_gate == "prequential" else in_sample_check(
             self.belief, self.dataset, target=self.target, floor=self.config.predictive_floor,
@@ -264,45 +259,70 @@ class ModelDiscoveryAgent:
 
         check_error = gate_error
         for _ in range(self.config.model_search_rounds):
-            if check_error <= self.config.error_threshold:
+            if check_error <= self.config.error_threshold or not self._expand():
                 break
-            if self.expansion_count >= self.config.expansion_cap or self.proposer is None:
-                break
-            reports = [
-                residual_report(
-                    fit,
-                    self.dataset,
+            check_error = (
+                in_sample_check(
+                    self.belief,
+                    self.dataset if self.config.backtest else [fresh],
                     target=self.target,
                     floor=self.config.predictive_floor,
                 )
-                for fit in self.belief.fits
-            ]
-            proposals = self.proposer.propose(
-                context=self._proposal_context(),
-                dataset=self.dataset,
-                current_models=self.models,
-                residuals=reports,
-                count=self.config.new_models_per_expansion,
-            )
-            existing_keys = {model.key for model in self.models}
-            novel = []
-            for proposal in proposals:
-                if proposal.key not in existing_keys:
-                    novel.append(proposal)
-                    existing_keys.add(proposal.key)
-            if not novel:
-                break
-            self.belief = self._fit([*self.models, *novel], reuse=True)
-            self.expansion_count += 1
-            check_error = in_sample_check(
-                self.belief,
-                self.dataset if self.config.backtest else [fresh],
-                target=self.target,
-                floor=self.config.predictive_floor,
+                if self.check is None else self.check(self.belief, fresh, self.dataset[:-1])
             )
 
         self._adapt_pool()
         return error
+
+    def _check(self, fresh: Datum) -> float:
+        """Pre-update adequacy of the current belief on a fresh datum.
+
+        The default is the paper's relative-residual ``predictive-check``; a
+        domain may supply ``check(belief, fresh, history)`` instead, compared
+        against the same ``error_threshold``.
+        """
+        if self.check is not None:
+            return float(self.check(self.belief, fresh, self.dataset))
+        return predictive_check(
+            self.belief,
+            fresh,
+            self.dataset,
+            target=self.target,
+            floor=self.config.predictive_floor,
+            backtest=self.config.backtest,
+        )
+
+    def _expand(self) -> bool:
+        """One ``expand-hyp-space`` call and re-judge; False if nothing new was added."""
+        if self.expansion_count >= self.config.expansion_cap or self.proposer is None:
+            return False
+        reports = [
+            residual_report(
+                fit,
+                self.dataset,
+                target=self.target,
+                floor=self.config.predictive_floor,
+            )
+            for fit in self.belief.fits
+        ]
+        proposals = self.proposer.propose(
+            context=self._proposal_context(),
+            dataset=self.dataset,
+            current_models=self.models,
+            residuals=reports,
+            count=self.config.new_models_per_expansion,
+        )
+        existing_keys = {model.key for model in self.models}
+        novel = []
+        for proposal in proposals:
+            if proposal.key not in existing_keys:
+                novel.append(proposal)
+                existing_keys.add(proposal.key)
+        if not novel:
+            return False
+        self.belief = self._fit([*self.models, *novel], reuse=True)
+        self.expansion_count += 1
+        return True
 
     def get_model(self) -> CandidateModel:
         """Current-data MAP structure, as in v5 Algorithm 2.

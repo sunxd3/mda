@@ -146,7 +146,7 @@ def run(environment, agent, *, budget, smoke=False, prediction="map",
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("domain", choices=["boxing", "chemistry", "physics", "neuron"])
+    parser.add_argument("domain", choices=["boxing", "chemistry", "physics", "neuron", "glucose"])
     parser.add_argument("--world", required=True)
     parser.add_argument("--difficulty", default="medium")
     parser.add_argument("--seed", type=int, default=0)
@@ -173,6 +173,9 @@ def main():
                         help="no expansion; for ChemBench also no LLM initialization (fixed nine laws)")
     parser.add_argument("--icl", action="store_true", help="also forecast using only the collected data")
     parser.add_argument("--recovery", action="store_true", help="symbolic-law or coarse neuron-class recovery diagnostic")
+    parser.add_argument("--cuts", type=int, nargs="+", default=[45],
+                        help="GlucoseBench forecast cuts in minutes (0, 45, 120, 180)")
+    parser.add_argument("--replicate", type=int, default=0, help="GlucoseBench replicate (paper: 0)")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.budget < 0:
@@ -192,6 +195,12 @@ def main():
         parser.error("task noise variances must be positive; neuron needs one or six values")
     if args.inference is not None and args.domain != "chemistry":
         parser.error("--inference applies only to chemistry")
+    if args.domain == "glucose" and (
+        args.budget > 4 or args.design not in {"model", "random"} or args.agent != "mda"
+        or args.recovery or args.stochastic or args.prediction not in {None, "map", "bma"}
+        or any(cut not in (0, 45, 120, 180) for cut in args.cuts)
+    ):
+        parser.error("glucose takes at most four experiments, model/random design, MDA, and cuts 0/45/120/180")
     if args.icl and args.smoke:
         parser.error("ICL needs a replay or explicitly authorized live client")
     if args.recovery and (args.domain not in {"chemistry", "physics", "neuron"}
@@ -208,6 +217,16 @@ def main():
             from mda.openai_client import OpenAIJSONClient
             client = OpenAIJSONClient(model=args.model or "gpt-5.6-luna",
                 cache_dir=args.cache_dir, replay_only=args.replay)
+    if args.domain == "glucose":
+        from .glucose import GlucoseBenchEnvironment, make_agent as make_glucose_agent, run_glucose
+        environment = GlucoseBenchEnvironment(args.world, replicate=args.replicate)
+        agent = make_glucose_agent(environment, client, seed=args.seed, smoke=args.smoke,
+                                   experiment_budget=args.budget)
+        result = run_glucose(environment, agent, budget=args.budget, cuts=tuple(dict.fromkeys(args.cuts)),
+                             design=args.design, prediction=args.prediction or "bma",
+                             no_m_open=args.no_m_open, icl_client=client if args.icl else None)
+        _write_result(args, result, client)
+        return
     fixed_library = args.domain == "chemistry" and args.no_m_open
     environment, agent = build(args.domain, args.world, client, seed=args.seed,
         smoke=args.smoke, budget=args.budget, stochastic=args.stochastic,
@@ -223,12 +242,16 @@ def main():
         evaluate=not (args.smoke and args.domain == "neuron"))
     if args.agent == "apprentice":
         result["design"] = "smoke-random" if args.smoke else "llm"
+    _write_result(args, result, client)
+
+
+def _write_result(args, result, client):
     result["request"] = {key: str(value) if isinstance(value, Path) else value
                          for key, value in vars(args).items()}
     result["model"] = None if client is None else client.model
     result["versions"] = {}
     for package in ("model-discovery-agent", "numpy", "scipy", "numpyro", "jax", "neuronbench",
-                    "anthropic", "openai"):
+                    "glucosebench", "anthropic", "openai"):
         try:
             result["versions"][package] = importlib.metadata.version(package)
         except importlib.metadata.PackageNotFoundError:
