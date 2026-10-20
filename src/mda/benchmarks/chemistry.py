@@ -17,6 +17,7 @@ exposed to the agent remain raw rates.
 
 from __future__ import annotations
 
+import ast
 import os
 import sys
 from collections.abc import Callable, Mapping, Sequence
@@ -75,6 +76,73 @@ CANONICAL_LAWS: tuple[tuple[str, str, tuple[tuple[str, float, float], ...]], ...
     ("noncompetitive_inhibition", "k*Enz*C_A/((1 + C_I/Ki)*(Km + C_A))",
      (_K, _KM, ("Ki", 0.001, 100.0))),
 )
+
+
+# v5 Appendix B proposer prompt (arXiv source prompts/chem_proposer.txt, the
+# same in v4): enzyme-kinetics framing with units, residual-directed negative
+# evidence when refining, and the restricted grammar with positive bounds.
+_CHEM_WORLD = (
+    "An enzyme catalyses a reaction with initial rate r0 [mM/min]. Controllable inputs: "
+    "C_A [substrate, mM], C_I [inhibitor, mM], C_B [2nd substrate, mM], C_P [product, mM], "
+    "Enz [enzyme, mg/mL], T [K], pH. Discover an algebraic law "
+    "r0 = f(C_A,C_I,C_B,C_P,Enz,T,pH; theta) from the data."
+)
+_CHEM_FUNCTIONS = frozenset(("exp", "log", "sqrt"))
+
+
+class ChemBenchProposer(SymbolicRegressionProposer):
+    """``SymbolicRegressionProposer`` with v5's published ChemBench prompt and grammar."""
+
+    system = "You are an enzyme kineticist proposing candidate rate laws to explain assay data. Reply JSON only."
+
+    def __init__(self, client: Any) -> None:
+        super().__init__(client, variable_names=VARIABLE_NAMES)
+
+    def check_hypothesis(self, expression: str, prior: UniformPrior) -> None:
+        for node in ast.walk(ast.parse(expression, mode="eval")):
+            if isinstance(node, ast.Call) and node.func.id not in _CHEM_FUNCTIONS:
+                raise ValueError(f"{node.func.id} is outside the ChemBench grammar")
+            if isinstance(node, ast.Mod):
+                raise ValueError("% is outside the ChemBench grammar")
+        if np.any(prior.lower <= 0):
+            raise ValueError("ChemBench parameter bounds must be positive")
+
+    def build_prompt(self, *, context, dataset, current_models, residuals, count) -> str:
+        # The agent appends its budget/phase status to the world context.
+        status = context.partition("\n\n")[2].strip()
+        lines = [_CHEM_WORLD, "", "Experiments (inputs -> r0):"]
+        lines += [
+            "  " + ", ".join(f"{name}={datum.action[name]:.6g}" for name in VARIABLE_NAMES)
+            + f" -> r0={float(np.asarray(datum.observation)):.6g}"
+            for datum in dataset
+        ]
+        reports = [r for r in residuals if r.get("structure")]
+        if reports:
+            lines += ["", "Forms ALREADY TRIED (in the pool) and their residuals -- do NOT re-propose any "
+                      "of these; propose forms STRUCTURALLY DIFFERENT from all of them:"]
+            lines += [f"  {r['structure']}  (median relative residual {r['median_relative_residual']:.3g})"
+                      for r in reports]
+            # "Current best" is the lowest-residual form: the proposer does not see weights.
+            best = min(reports, key=lambda r: r["median_relative_residual"])
+            correlations = next((c["input_signed_residual_correlations"]
+                                 for c in self.input_residual_correlations(dataset, [best])), {})
+            if correlations:
+                top = sorted(correlations.items(), key=lambda item: -abs(item[1]))[:2]
+                lines.append(f"  The best form's residual correlates most with "
+                             + ", ".join(f"{name} (r={value:+.2f})" for name, value in top)
+                             + " -- consider a factor in those variable(s).")
+            lines.append("Refine by proposing a DIFFERENT algebraic form -- do NOT patch with ad-hoc "
+                         "offset/softening terms.")
+        if status:
+            lines += ["", status]
+        lines += [
+            "",
+            f"Propose {count} distinct plausible rate laws (or refinements of those tried).",
+            "Each 'expr' is a Python expression in the 7 input names + your declared params, using only "
+            "+ - * / ** and exp, log, sqrt. Give physically plausible positive param bounds. JSON schema: "
+            '{"hypotheses":[{"name":str,"expr":str,"params":[{"name":str,"low":float,"high":float}]}]}',
+        ]
+        return "\n".join(lines)
 
 
 def _oracle_class() -> type:
@@ -252,7 +320,7 @@ def make_agent(
         raise ValueError("inference must be bic or smc")
     proposer = None
     if client is not None and llm_initialization:
-        proposer = SymbolicRegressionProposer(client, variable_names=VARIABLE_NAMES)
+        proposer = ChemBenchProposer(client)
     lower = [PARAM_RANGES[name][0] for name in VARIABLE_NAMES]
     upper = [PARAM_RANGES[name][1] for name in VARIABLE_NAMES]
     optimizer = CMAESOptimizer(

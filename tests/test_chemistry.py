@@ -2,7 +2,8 @@ import numpy as np
 import pytest
 
 from mda.benchmarks.chemistry import (
-    CANONICAL_LAWS, PARAM_RANGES, VARIABLE_NAMES, ChemBenchEnvironment, canonical_models, make_agent,
+    CANONICAL_LAWS, PARAM_RANGES, VARIABLE_NAMES, ChemBenchEnvironment, ChemBenchProposer,
+    canonical_models, make_agent,
 )
 from mda.evidence import BICEvidence
 
@@ -112,3 +113,24 @@ def test_driver_records_pass_metrics_and_samples_random_designs(monkeypatch):
     assert set(last["action"]) == set(VARIABLE_NAMES)
     with pytest.raises(ValueError, match="selects only the ChemBench arm"):
         build("boxing", "death", None, seed=0, smoke=True, budget=1, inference="smc")
+
+
+def test_proposer_uses_v5_prompt_and_drops_laws_outside_its_grammar(environment):
+    class Client:
+        def ask_json(self, system, prompt, **kwargs):
+            self.system, self.prompt = system, prompt
+            positive = [{"name": "k", "low": .01, "high": 100}, {"name": "Km", "low": .001, "high": 100}]
+            return {"hypotheses": [
+                {"name": "mm", "expr": "k*Enz*C_A/(Km + C_A)", "params": positive},
+                {"name": "tanh", "expr": "k*Enz*tanh(C_A/Km)", "params": positive},
+                {"name": "offset", "expr": "k*C_A + c", "params": [positive[0], {"name": "c", "low": -1, "high": 1}]},
+            ]}
+
+    client = Client()
+    models = ChemBenchProposer(client).propose(
+        context=environment.context + "\n\nCurrent phase: explore.", dataset=environment.initial_data,
+        current_models=(), residuals=(), count=3)
+    assert [model.name for model in models] == ["mm"]
+    assert client.system.startswith("You are an enzyme kineticist")
+    assert "C_A=0.03, C_I=0, C_B=1, C_P=0, Enz=1, T=310, pH=7 -> r0=" in client.prompt
+    assert "Current phase: explore." in client.prompt and "ALREADY TRIED" not in client.prompt
