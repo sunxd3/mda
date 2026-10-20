@@ -49,12 +49,12 @@ v5's universe is exactly the pinned registry's 57 standard worlds (`chemistry.be
 | Prediction | MAP |
 | SMC control (`--inference smc`) | Tempered SMC with 100 particles, three rejuvenation moves, ESS target 0.6, and a 2-nat-per-parameter prior |
 
-The LLM proposer is `SymbolicRegressionProposer`. Smoke mode uses 20 CMA-ES evaluations, two BIC starts, and 12 queries.
+The LLM proposer is `ChemBenchProposer`, which sends v5's published ChemBench prompt (`prompts/chem_proposer.txt` in the arXiv source): the enzyme-kinetics framing with input units, the experiments, and, when refining, the forms already tried with their median residuals and the inputs the best form's residual correlates with. It drops laws that use functions other than exp, log, and sqrt, or `%`, and laws with a non-positive parameter bound. Smoke mode uses 20 CMA-ES evaluations, two BIC starts, and 12 queries.
 
 ## Differences from the paper
 
 - v5's exact per-call responses and configuration files are not public.
-- v5's prompts are published, but this proposer uses a generic prompt. It lacks the enzyme-kinetics framing, the input units, the restricted grammar (`+ - * / **` with exp, log, and sqrt; 15 functions are allowed here), the requirement of positive bounds (not enforced here), and the "structurally different" and explore/refine instructions. In exchange it sends every pool structure's priors, per-experiment residuals, and residual–input correlations.
+- The prompt template leaves some details open. Here the "current best form" whose residual correlations are reported is the lowest-residual form, because the proposer does not see model weights, and the two inputs with the largest absolute correlation are named. The budget/phase line is the agent's own status text.
 - The canonical laws' forms follow the upstream rate functions; their bounds, the number of multistarts, and v4's τ_e, R_m, and N_e^max values are local choices.
 - Rendered v5 gives no query count and says the seed changes the queries. Its source uses the benchmark's fixed 1000-condition grid for the pass rate and a separate 60-condition draw for nMSLE; this runner uses one seed-dependent 1000-point set for both.
 - The expansion and shrink checks use raw-rate relative residuals rather than v5's `log(1+y)` target.

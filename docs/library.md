@@ -222,7 +222,8 @@ Concrete proposers:
 
 | Proposer | Domain |
 |---|---|
-| `SymbolicRegressionProposer(client, variable_names=("x",))` | Algebraic scalar laws. Also receives signed residual–input correlations |
+| `SymbolicRegressionProposer(client, variable_names=("x",))` | Algebraic scalar laws. Also receives signed residual–input correlations. Subclass it and override `system`, `build_prompt`, and `check_hypothesis` for a domain prompt and grammar |
+| `mda.benchmarks.chemistry.ChemBenchProposer(client)` | ChemBench rate laws with v5's published prompt and restricted grammar |
 | `NeuronBenchProposer(client)` | Hodgkin–Huxley channel hypotheses |
 | `mda.benchmarks.glucose.GlucoseProposer` | Compartmental glucose ODEs |
 | NumPyro proposer in `mda.benchmarks.boxing` | Generated NumPyro programs |

@@ -233,7 +233,13 @@ def compile_expression(
 
 
 class SymbolicRegressionProposer:
-    """Paper-style JSON proposer for algebraic scalar models."""
+    """Paper-style JSON proposer for algebraic scalar models.
+
+    Subclasses can replace ``system`` and ``build_prompt`` for a domain prompt,
+    and ``check_hypothesis`` to reject laws outside a domain grammar.
+    """
+
+    system = "You are a scientific model-discovery assistant. Reply with JSON only."
 
     def __init__(
         self,
@@ -244,32 +250,13 @@ class SymbolicRegressionProposer:
         self.client = client
         self.variable_names = tuple(variable_names)
 
-    def propose(
-        self,
-        *,
-        context: str,
-        dataset: Sequence[Datum],
-        current_models: Sequence[CandidateModel],
-        residuals: Sequence[dict[str, Any]],
-        count: int,
-    ) -> list[CandidateModel]:
-        observations = "\n".join(
-            f"  {datum.action!r} -> {np.asarray(datum.observation).tolist()}" for datum in dataset
-        ) or "  (none)"
-        tried = json.dumps(list(residuals))
-        structures = json.dumps([
-            {
-                "name": model.name,
-                "structure": model.structure,
-                "uniform_parameter_priors": {
-                    name: [float(low), float(high)]
-                    for name, low, high in zip(
-                        model.prior.names, model.prior.lower, model.prior.upper, strict=True
-                    )
-                },
-            }
-            for model in current_models
-        ])
+    def check_hypothesis(self, expression: str, prior: UniformPrior) -> None:
+        """Raise ``ValueError`` to drop a proposal; any whitelisted law is accepted here."""
+
+    def input_residual_correlations(
+        self, dataset: Sequence[Datum], residuals: Sequence[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Pearson correlation of each numeric input with each model's signed residuals."""
         correlations = []
         for report in residuals:
             signed = report.get("signed_per_experiment")
@@ -313,6 +300,35 @@ class SymbolicRegressionProposer:
                     "structure": report.get("structure"),
                     "input_signed_residual_correlations": by_input,
                 })
+        return correlations
+
+    def build_prompt(
+        self,
+        *,
+        context: str,
+        dataset: Sequence[Datum],
+        current_models: Sequence[CandidateModel],
+        residuals: Sequence[dict[str, Any]],
+        count: int,
+    ) -> str:
+        observations = "\n".join(
+            f"  {datum.action!r} -> {np.asarray(datum.observation).tolist()}" for datum in dataset
+        ) or "  (none)"
+        tried = json.dumps(list(residuals))
+        structures = json.dumps([
+            {
+                "name": model.name,
+                "structure": model.structure,
+                "uniform_parameter_priors": {
+                    name: [float(low), float(high)]
+                    for name, low, high in zip(
+                        model.prior.names, model.prior.lower, model.prior.upper, strict=True
+                    )
+                },
+            }
+            for model in current_models
+        ])
+        correlations = self.input_residual_correlations(dataset, residuals)
         correlation_context = json.dumps(correlations)
         variables = ", ".join(self.variable_names)
         prompt = f"""{context}
@@ -337,6 +353,21 @@ Each expr must be a Python expression using only variables {variables}, declared
 parameters, arithmetic, and these functions: {', '.join(sorted(_FUNCTIONS))}.
 Every unknown coefficient or exponent must be a named parameter with finite,
 scientifically plausible uniform-prior bounds. Return JSON only."""
+        return prompt
+
+    def propose(
+        self,
+        *,
+        context: str,
+        dataset: Sequence[Datum],
+        current_models: Sequence[CandidateModel],
+        residuals: Sequence[dict[str, Any]],
+        count: int,
+    ) -> list[CandidateModel]:
+        prompt = self.build_prompt(
+            context=context, dataset=dataset, current_models=current_models,
+            residuals=residuals, count=count,
+        )
         schema = {
             "type": "object",
             "properties": {
@@ -370,7 +401,7 @@ scientifically plausible uniform-prior bounds. Return JSON only."""
             "additionalProperties": False,
         }
         payload = self.client.ask_json(
-            "You are a scientific model-discovery assistant. Reply with JSON only.",
+            self.system,
             prompt,
             schema=schema,
             name="model_hypotheses",
@@ -387,6 +418,7 @@ scientifically plausible uniform-prior bounds. Return JSON only."""
                     np.asarray([parameter["high"] for parameter in item["params"]]),
                 )
                 expression = canonical_expression(item["expr"])
+                self.check_hypothesis(expression, prior)
                 if expression in existing:
                     continue
                 predict = compile_expression(expression, self.variable_names, names)
