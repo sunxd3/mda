@@ -30,6 +30,7 @@ class OpenAIJSONClient:
         cache_dir: Path | str | None = None,
         reasoning_effort: str = "medium",
         replay_only: bool = False,
+        sample: str | None = None,
     ) -> None:
         if replay_only and cache_dir is None:
             raise ValueError("replay_only requires cache_dir")
@@ -37,6 +38,7 @@ class OpenAIJSONClient:
         self.cache_dir = Path(cache_dir) if cache_dir is not None else None
         self.reasoning_effort = reasoning_effort
         self.replay_only = replay_only
+        self.sample = sample
         self.api_key = api_key
         self._client = None
         if not replay_only:
@@ -57,8 +59,11 @@ class OpenAIJSONClient:
     def _cache_path(self, request: dict[str, Any]) -> Path | None:
         if self.cache_dir is None:
             return None
+        # ``sample`` labels an independent draw (e.g. a benchmark run seed):
+        # runs that send identical requests must not share cached responses.
+        keyed = request if self.sample is None else {"request": request, "sample": self.sample}
         canonical = json.dumps(
-            request, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+            keyed, sort_keys=True, separators=(",", ":"), ensure_ascii=False
         ).encode("utf-8")
         return self.cache_dir / f"{hashlib.sha256(canonical).hexdigest()}.txt"
 

@@ -170,3 +170,14 @@ def test_request_kwargs_are_accepted_by_installed_sdk(monkeypatch, model):
         "system", "prompt", schema={"type": "object"}
     )
     assert set(calls[0]) <= accepted, set(calls[0]) - accepted
+
+
+def test_sample_label_separates_cache_entries_for_identical_requests(monkeypatch, tmp_path):
+    calls = _install_openai_stub(monkeypatch, [_completed('{"seed": 0}'), _completed('{"seed": 1}')])
+    seed0 = OpenAIJSONClient(api_key="stub", cache_dir=tmp_path, sample="chemistry/w/seed=0")
+    seed1 = OpenAIJSONClient(api_key="stub", cache_dir=tmp_path, sample="chemistry/w/seed=1")
+    assert seed0.ask_json("system", "prompt", schema={"type": "object"}) == {"seed": 0}
+    assert seed1.ask_json("system", "prompt", schema={"type": "object"}) == {"seed": 1}
+    replay = OpenAIJSONClient(cache_dir=tmp_path, replay_only=True, sample="chemistry/w/seed=0")
+    assert replay.ask_json("system", "prompt", schema={"type": "object"}) == {"seed": 0}
+    assert len(calls) == 2

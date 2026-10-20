@@ -52,7 +52,7 @@ Exactly one mode is required.
 |---|---|---|
 | `--smoke` | None | Small numerical budgets and generic, non-truth baselines (for ChemBench, the nine canonical laws). Neuron smoke checks feature forecasts but skips the expensive held-out 200-rollout scoring |
 | `--replay` | Cache only | Reads previously captured responses and fails on a cache miss without contacting a provider |
-| `--live` | Paid | Explicitly authorizes paid calls; responses are cached |
+| `--live` | Paid | Explicitly authorizes paid calls; responses are cached per domain, world, and seed |
 
 As in v5, the default provider is OpenAI `gpt-5.6-luna` at medium reasoning effort, except Boxing, whose appendix results use Anthropic `claude-opus-4-7` with reasoning off. v5 states no temperature and none is sent. Requests are streamed, so any output budget is accepted, and only a response that stopped at the forced tool call is cached. `--provider` and `--model` override these. No model availability or live score claim is made here.
 
