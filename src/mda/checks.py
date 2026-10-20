@@ -1,4 +1,4 @@
-"""Target-space residual checks used to trigger M-open expansion (Algorithm 8)."""
+"""Target-space residual checks used to trigger M-open expansion (``predictive-check``)."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from typing import Any
 import numpy as np
 
 from .posterior import BeliefState, ModelFit
-from .types import Datum
+from .types import CandidateModel, Datum, NonFinitePrediction, PredictFn
 
 
 TargetFn = Callable[[np.ndarray, Any], np.ndarray]
@@ -34,6 +34,29 @@ def relative_residual(
     return float(np.median(np.abs(observed - predicted) / denominator))
 
 
+def observed_target_prediction(model: CandidateModel) -> PredictFn:
+    """The prediction compared against ``target(observation)`` in residual checks.
+
+    By default this is ``model.target_prediction``. A model whose evaluation
+    target cannot be recovered from its observations (the stochastic neuron
+    features, which count spikes the ~4 ms observation grid misses) supplies
+    ``metadata["observed_target_prediction"]``: the same functional evaluated
+    on the observation grid, so checks and residual reports compare like with
+    like while held-out evaluation keeps the full-resolution target.
+    """
+    callback = model.metadata.get("observed_target_prediction")
+    if callback is None:
+        return model.target_prediction
+
+    def predict(theta, action):
+        value = np.asarray(callback(np.asarray(theta, dtype=float), action), dtype=float)
+        if np.any(~np.isfinite(value)):
+            raise NonFinitePrediction(f"model {model.name!r} returned a non-finite target prediction")
+        return value
+
+    return predict
+
+
 def fit_residual(
     fit: ModelFit,
     datum: Datum,
@@ -42,7 +65,7 @@ def fit_residual(
 ) -> float:
     theta = fit.parameters.map_parameters
     observed = target(datum.observation, datum.action)
-    predicted = fit.model.target_prediction(theta, datum.action)
+    predicted = observed_target_prediction(fit.model)(theta, datum.action)
     return relative_residual(observed, predicted, floor)
 
 
@@ -87,7 +110,7 @@ def residual_report(
     for datum in dataset:
         observed = np.asarray(target(datum.observation, datum.action), dtype=float).reshape(-1)
         predicted = np.asarray(
-            fit.model.target_prediction(theta, datum.action), dtype=float
+            observed_target_prediction(fit.model)(theta, datum.action), dtype=float
         ).reshape(-1)
         if observed.shape != predicted.shape:
             raise ValueError("observed and predicted targets have different shapes")

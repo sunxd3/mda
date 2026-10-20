@@ -1,7 +1,8 @@
-"""Model-level evidence weighting and support pruning (Algorithm 6)."""
+"""Model-level evidence weighting and support pruning (``model-posterior``)."""
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Iterator, Sequence
 
@@ -35,13 +36,9 @@ class BeliefState:
             or not np.isclose(weights.sum(), 1.0)
         ):
             raise ValueError("model weights must be normalized and align with fits")
-        positive = weights > 0.0
-        object.__setattr__(
-            self,
-            "fits",
-            tuple(fit for fit, keep in zip(self.fits, positive, strict=True) if keep),
-        )
-        object.__setattr__(self, "model_weights", weights[positive])
+        # Fits whose weight underflows to zero stay in the pool: v5 keeps valid
+        # older models, and later data can restore their weight.
+        object.__setattr__(self, "model_weights", weights)
 
     @property
     def map_index(self) -> int:
@@ -52,10 +49,15 @@ class BeliefState:
         return self.fits[self.map_index]
 
     def iter_parameter_particles(self) -> Iterator[tuple[CandidateModel, np.ndarray, float]]:
+        """Weighted (model, theta) pairs with positive mass."""
         for model_weight, fit in zip(self.model_weights, self.fits, strict=True):
+            if model_weight == 0.0:
+                continue
             for theta, parameter_weight in zip(
                 fit.parameters.particles, fit.parameters.weights, strict=True
             ):
+                if parameter_weight == 0.0:
+                    continue
                 yield fit.model, theta, float(model_weight * parameter_weight)
 
 
@@ -75,8 +77,16 @@ def fit_model_posterior(
     model_cap: int,
     occam_penalty: float,
     rng: np.random.Generator,
+    evidence: Callable[..., ParameterPosterior] | None = None,
+    reuse: Mapping[str, ParameterPosterior] | None = None,
 ) -> BeliefState:
-    """Full-batch evidence refit followed by deterministic top-N support control."""
+    """Evidence refit followed by deterministic top-N support control.
+
+    ``evidence`` maps ``(dataset, model, likelihood, rng)`` to a parameter
+    posterior (tempered SMC with ``smc_config`` when omitted). ``reuse`` holds
+    posteriors already computed on exactly this dataset, keyed by model key;
+    those structures are not refitted.
+    """
     if model_cap < 1:
         raise ValueError("model_cap must be positive")
     if occam_penalty < 0:
@@ -86,8 +96,14 @@ def fit_model_posterior(
         raise ValueError("at least one candidate model is required")
 
     fits = []
+    reuse = reuse or {}
     for model in candidates:
-        posterior = parameter_posterior(dataset, model, likelihood, smc_config, rng)
+        if model.key in reuse:
+            posterior = reuse[model.key]
+        elif evidence is None:
+            posterior = parameter_posterior(dataset, model, likelihood, smc_config, rng)
+        else:
+            posterior = evidence(dataset, model, likelihood, rng)
         score = posterior.log_evidence - occam_penalty * model.parameter_count
         fits.append(ModelFit(model=model, parameters=posterior, log_score=score))
     scores = np.array([fit.log_score for fit in fits])
@@ -102,8 +118,9 @@ def fit_model_posterior(
     log_mixture_evidence = logsumexp(scores) - logsumexp(log_model_prior_scores)
 
     all_weights, _ = normalize_log_weights(scores)
-    order = np.argsort(-scores, kind="stable")
-    keep = order[: min(model_cap, len(order))]
+    # Structures whose fit failed entirely (non-finite evidence) leave the pool.
+    order = [index for index in np.argsort(-scores, kind="stable") if np.isfinite(scores[index])]
+    keep = np.asarray(order[: min(model_cap, len(order))], dtype=int)
     discarded_mass = float(1.0 - all_weights[keep].sum())
     kept_scores = scores[keep]
     kept_weights, _ = normalize_log_weights(kept_scores)

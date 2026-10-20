@@ -85,9 +85,12 @@ def test_designs_are_not_repeated_by_default():
     assert agent.design() == 1.0
 
 
-def test_duplicate_proposal_does_not_consume_expansion_budget():
+def test_duplicate_proposals_count_toward_the_expansion_cap():
     class DuplicateProposer:
+        calls = 0
+
         def propose(self, **kwargs):
+            DuplicateProposer.calls += 1
             return [constant_model()]
 
     agent = ModelDiscoveryAgent(
@@ -99,14 +102,16 @@ def test_duplicate_proposal_does_not_consume_expansion_budget():
         actions=[0.0, 1.0],
         observation_covariance=0.05**2,
         config=AgentConfig(
-            model_search_rounds=1,
+            model_search_rounds=2,
             expansion_cap=1,
             error_threshold=0.1,
             smc=SMCConfig(parameter_particles=16, rejuvenation_steps=0),
         ),
     )
     agent.update_state(1.0, np.asarray(2.0))
-    assert agent.expansion_count == 0
+    agent.update_state(0.5, np.asarray(3.0))
+    # v5 Algorithm 2: every call increments n_e, so N_e^max bounds LLM calls.
+    assert agent.expansion_count == DuplicateProposer.calls == 1
     assert len(agent.models) == 1
 
 
@@ -238,14 +243,19 @@ def test_adaptive_pool_requires_both_gates_and_reopens_on_fresh_failure():
                                smc=SMCConfig(parameter_particles=1, rejuvenation_steps=0)),
         )
 
-    confident = make(1.0)
+    def updated(agent, observation=1.0):
+        agent.update_state(1.0, np.asarray(observation))
+        return agent
+
+    unadapted = make(1.0)
+    assert unadapted.active_model_cap == 3  # no shrinkage at initialization
+    confident = updated(make(1.0))
     assert confident.active_model_cap == 2
-    assert len(confident.models) == 2
-    assert confident.belief.discarded_mass > 0
+    assert [model.name for model in confident.models] == ["one", "two"]
     # Confident but poor fit must not shrink; nor may good fit without confidence.
-    assert make(10.0).active_model_cap == 3
-    assert make(1.0, confidence=0.99).active_model_cap == 3
-    confident.update_state(1.0, np.asarray(3.0))
+    assert updated(make(10.0), 10.0).active_model_cap == 3
+    assert updated(make(1.0, confidence=0.999)).active_model_cap == 3  # MAP weight ~0.998
+    confident.update_state(2.0, np.asarray(3.0))
     assert confident.active_model_cap == 3
     assert len(confident.models) == 3  # expansion used reopened cap before the refit
 
@@ -266,3 +276,64 @@ def test_task_design_has_separate_target_noise_units():
     )
     assert agent.design() == 2.0
     assert agent.last_design_scores.tolist() == pytest.approx([1.5, 3.0])
+
+
+def domain_limited_model():
+    def predict(theta, x):
+        if x < 0:
+            raise ValueError("log of a negative input")
+        return np.asarray(np.log(x) if x > 0 else 0.0)
+
+    return fixed_model("log", lambda x: predict(None, x))
+
+
+def test_an_experiment_the_map_cannot_evaluate_fails_the_check_instead_of_aborting():
+    agent = ModelDiscoveryAgent(
+        context="", initial_data=[Datum(1.0, np.asarray(0.0)), Datum(2.0, np.asarray(np.log(2.0)))],
+        initial_models=[domain_limited_model(), constant_model()],
+        likelihood=DeterministicGaussianLikelihood(0.05), actions=[-1.0, 3.0],
+        observation_covariance=0.05**2,
+        config=AgentConfig(expansion_cap=0, smc=SMCConfig(parameter_particles=16, max_temperatures=4)),
+    )
+    assert agent.belief.map_fit.model.name == "log"
+    error = agent.update_state(-1.0, np.asarray(0.0))
+    assert error == np.inf
+    assert len(agent.dataset) == 3 and agent.experiments_run == 1
+    assert agent.belief.map_fit.model.name == "zero"  # the only model that explains every datum
+
+
+def test_a_failed_refit_leaves_the_agent_as_it_was():
+    agent = ModelDiscoveryAgent(
+        context="", initial_data=[Datum(1.0, np.asarray(0.0))],
+        initial_models=[domain_limited_model()],
+        likelihood=DeterministicGaussianLikelihood(0.05), actions=[-1.0, 3.0],
+        observation_covariance=0.05**2,
+        config=AgentConfig(expansion_cap=0, smc=SMCConfig(parameter_particles=16, max_temperatures=4)),
+    )
+    before = (len(agent.dataset), agent.experiments_run, set(agent.used_action_keys), agent.belief)
+    with pytest.raises(ValueError, match="non-finite evidence"):
+        agent.update_state(-1.0, np.asarray(0.0))
+    assert (len(agent.dataset), agent.experiments_run, agent.used_action_keys, agent.belief) == before
+
+
+def test_task_flavours_require_query_actions_and_iterators_still_mark_initial_actions():
+    make = lambda **kwargs: ModelDiscoveryAgent(
+        context="", initial_models=[constant_model()],
+        likelihood=DeterministicGaussianLikelihood(0.05), actions=[0.0, 1.0],
+        observation_covariance=0.05**2, **kwargs,
+    )
+    with pytest.raises(ValueError, match="query_actions"):
+        make(initial_data=[Datum(0.0, np.asarray(0.0))], config=AgentConfig(design_flavour="task"))
+    agent = make(initial_data=iter([Datum(0.0, np.asarray(0.0))]))
+    assert agent.used_action_keys == {"0.0"}
+    assert agent.available_actions() == [1.0]
+
+
+def test_default_action_key_is_exact_for_arrays():
+    from mda.agent import default_action_key
+
+    first, second = np.asarray([0.1, 0.2]), np.asarray([0.1, 0.2 + 1e-12])
+    assert repr(first) == repr(second)
+    assert default_action_key(first) != default_action_key(second)
+    assert default_action_key({"b": first, "a": 1}) == default_action_key({"a": 1, "b": first.copy()})
+    assert default_action_key(1.0) == "1.0"

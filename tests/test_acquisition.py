@@ -6,10 +6,10 @@ import numpy as np
 import pytest
 
 from mda.acquisition import (
-    full_observation_task_value_of_information,
+    choose_design, full_observation_task_value_of_information,
     joint_eig, model_eig, task_value_of_information,
 )
-from mda.posterior import BeliefState, ModelFit
+from mda.posterior import BeliefState, ModelFit, fit_model_posterior
 from mda.smc import ParameterPosterior
 from mda.types import CandidateModel, UniformPrior
 
@@ -56,15 +56,42 @@ def test_task_voi_is_larger_for_query_correlated_design():
     assert null == 0.0
 
 
-def test_manually_constructed_belief_drops_zero_mass_fit():
+def test_zero_mass_fit_stays_in_pool_but_not_in_design_scores():
     good = fit("good", [[0.0]], lambda theta, x: np.asarray(1.0))
     invalid = fit("invalid", [[0.0]], lambda theta, x: np.asarray(np.nan))
     belief = BeliefState((good, invalid), np.asarray([1.0, 0.0]))
 
-    assert belief.fits == (good,)
-    assert belief.model_weights.tolist() == [1.0]
+    assert belief.fits == (good, invalid)
+    assert belief.model_weights.tolist() == [1.0, 0.0]
     assert model_eig(0.0, belief, 1.0) == 0.0
     assert joint_eig(0.0, belief, 1.0) == 0.0
+
+
+def test_model_posterior_keeps_underflowed_models_and_drops_failed_fits():
+    from mda.smc import SMCConfig
+
+    def evidence_for(scores):
+        def evidence(dataset, model, likelihood, rng):
+            return replace(fit(model.name, [[0.0]], model.predict).parameters,
+                           log_evidence=scores[model.name])
+        return evidence
+
+    models = [fit(name, [[0.0]], lambda theta, x: np.asarray(0.0)).model for name in ("best", "far", "failed")]
+    belief = fit_model_posterior(
+        [], models, None, SMCConfig(), model_cap=16, occam_penalty=0.0, rng=np.random.default_rng(0),
+        evidence=evidence_for({"best": 0.0, "far": -2000.0, "failed": -np.inf}),
+    )
+    assert [f.model.name for f in belief.fits] == ["best", "far"]
+    assert belief.model_weights.tolist() == [1.0, 0.0]
+
+
+def test_design_skips_actions_a_weighted_model_cannot_predict():
+    left = fit("left", [[0.0]], lambda theta, x: np.asarray(np.inf if x == "bad" else 0.0))
+    right = fit("right", [[0.0]], lambda theta, x: np.asarray(1.0))
+    belief = BeliefState((left, right), np.asarray([0.5, 0.5]))
+    action, scores = choose_design(["bad", "good"], belief, flavour="model", observation_covariance=1.0)
+    assert action == "good"
+    assert scores[0] == -np.inf
 
 
 def test_task_uses_targets_at_design_not_raw_observations():
@@ -114,3 +141,32 @@ def test_independent_trace_noise_never_uses_dense_linear_algebra(monkeypatch):
     belief = BeliefState((left, right), np.asarray([0.25, 0.75]))
     assert model_eig(None, belief, 2.0) == pytest.approx(3750.0)
     assert joint_eig(None, belief, np.full(10_000, 2.0)) == pytest.approx(3750.0)
+
+
+def test_zero_weight_particles_are_not_asked_to_predict():
+    def predict(theta, action):
+        if theta[0] > 5:
+            return np.asarray(np.nan)
+        return np.asarray(theta[0] * action)
+
+    posterior = replace(
+        fit("line", [[1.0], [9.0]], predict).parameters, weights=np.asarray([1.0, 0.0]),
+    )
+    belief = BeliefState((ModelFit(fit("line", [[1.0], [9.0]], predict).model, posterior, 0.0),),
+                         np.asarray([1.0]), 0.0, 0.0)
+    assert np.isfinite(model_eig(2.0, belief, 1.0))
+    assert np.isfinite(joint_eig(2.0, belief, 1.0))
+
+
+def test_design_tolerates_the_domain_errors_fitting_tolerates():
+    def singular(theta, action):
+        if action == 0.0:
+            raise ValueError("force is singular at zero separation")
+        return np.asarray(theta[0] / action)
+
+    belief = BeliefState(
+        (fit("singular", [[1.0], [2.0]], singular), fit("line", [[1.0], [2.0]], lambda t, a: np.asarray(t[0] * a))),
+        np.asarray([0.5, 0.5]), 0.0, 0.0,
+    )
+    action, scores = choose_design([0.0, 1.0], belief, flavour="model", observation_covariance=1.0)
+    assert action == 1.0 and scores[0] == -np.inf

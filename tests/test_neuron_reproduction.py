@@ -26,7 +26,7 @@ def test_stochastic_d0_is_fixed_and_smoke_is_cheap():
     environment = StochasticNeuronBenchEnvironment("ca_rebound", seed=3)
     assert [p[0] for p in environment.initial_protocols] == [
         "brief step (12 uA, 40 ms)",
-        "long step (10 uA, 300 ms)",
+        "weak step (5 uA, 120 ms)",
     ]
     agent = make_agent(environment, None, smoke=True)
     model = agent.models[0]
@@ -34,6 +34,16 @@ def test_stochastic_d0_is_fixed_and_smoke_is_cheap():
     assert model.metadata["prediction_rollouts"] == 2
     assert agent.likelihood.latent_particles == 3
     assert agent.config.smc.parameter_particles == 2
+    from mda.evidence import RecursiveEvidence
+    assert isinstance(agent.evidence, RecursiveEvidence)
+
+
+def test_stochastic_archive_is_frozen_unless_online_expansion_is_requested():
+    environment = StochasticNeuronBenchEnvironment("ca_rebound", seed=3)
+    assert make_agent(environment, None, smoke=True).config.expansion_cap == 0
+    assert make_agent(environment, None, smoke=True, online_expansion=True).config.expansion_cap == 3
+    with pytest.raises(ValueError, match="stochastic"):
+        make_agent(NeuronBenchEnvironment("ca_rebound", seed=3), None, smoke=True, online_expansion=True)
 
 
 def test_stochastic_proposer_preserves_hypothesis_metadata():
@@ -56,7 +66,7 @@ def test_stochastic_proposer_preserves_hypothesis_metadata():
     assert model[0].metadata["prediction_rollouts"] == 4
 
 
-def test_stochastic_evaluation_uses_component_query_variance(monkeypatch):
+def test_stochastic_evaluation_uses_v5_fixed_feature_scales(monkeypatch):
     environment = StochasticNeuronBenchEnvironment("ca_rebound", seed=1)
     truth = {
         protocol[0]: (np.arange(6, dtype=float) + index, 1, 0)
@@ -66,8 +76,10 @@ def test_stochastic_evaluation_uses_component_query_variance(monkeypatch):
     score = environment.evaluate_predictor(
         lambda protocol: truth[protocol[0]][0] + np.arange(1, 7)
     )
-    expected = np.mean(np.arange(1, 7, dtype=float) ** 2 / np.var(np.arange(6)))
-    assert score == pytest.approx(expected)
+    scales = np.array([3.0, 3.0, 3.0, 3.0, 12.0, 8.0])
+    assert score == pytest.approx(np.mean((np.arange(1, 7) / scales) ** 2))
+    from mda.neuronbench_adapter import FEATURE_SCALES
+    assert np.array_equal(FEATURE_SCALES, nb.evaluator._EVAL_FEAT_SCALES)
 
 
 def test_structural_recovery_uses_channel_properties_not_names():
@@ -99,3 +111,12 @@ def test_recovery_runner_passes_fitted_neuron_parameters():
     recovery = result["history"][0]["recovery"]
     assert recovery["class"] == "unknown"  # Plain baseline has no extra channel.
     assert not recovery["recovered"]
+
+
+def test_stochastic_menu_allows_repeats_only_once_exhausted():
+    environment = StochasticNeuronBenchEnvironment("ca_rebound", seed=3)
+    agent = make_agent(environment, None, smoke=True, experiment_budget=8)
+    unused = agent.available_actions()
+    assert len(unused) == 7 and agent.config.repeat_when_exhausted
+    agent.used_action_keys.update(agent.action_key(action) for action in unused)
+    assert len(agent.available_actions()) == len(environment.actions)

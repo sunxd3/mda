@@ -57,3 +57,15 @@ def test_scalar_predictions_and_two_argument_neuron_target():
     )
     assert float(predictor("query")) == 1.5
     assert json.loads(client.calls[0][1])["observations"][0]["target"] == [2, 8]
+
+
+@pytest.mark.parametrize("queries, shape, expected", [
+    (2, (2,), 800),
+    (1000, (), 32_000),
+    (100, (6,), 19_200),
+])
+def test_icl_token_budget_keeps_floor_and_per_value_margin(queries, shape, expected):
+    value = np.zeros(shape).tolist()
+    client = FakeClient({"predictions": [value] * queries})
+    make_icl_predictor(client, "c", [], range(queries), target_shape=shape)
+    assert client.calls[0][2]["max_tokens"] == expected

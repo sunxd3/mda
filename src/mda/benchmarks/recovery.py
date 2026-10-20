@@ -14,7 +14,7 @@ from mda.types import CandidateModel, UniformPrior
 
 _SYMBOLIC_FUNCTIONS = {
     "abs", "cos", "exp", "gamma", "k0", "k1", "log", "log10",
-    "maximum", "minimum", "sign", "sin", "sqrt", "tan", "tanh", "where",
+    "maximum", "minimum", "sign", "sin", "sqrt", "tan", "tanh",
 }
 
 
@@ -59,7 +59,6 @@ def canonical_symbolic_candidate(
         "log": sp.log, "log10": lambda value: sp.log(value, 10),
         "maximum": sp.Max, "minimum": sp.Min, "sign": sp.sign,
         "sin": sp.sin, "sqrt": sp.sqrt, "tan": sp.tan, "tanh": sp.tanh,
-        "where": lambda condition, yes, no: sp.Piecewise((yes, condition), (no, True)),
     }
     binary = {
         ast.Add: lambda a, b: a + b, ast.Sub: lambda a, b: a - b,
@@ -122,7 +121,7 @@ def canonical_symbolic_candidate(
             inputs = [action]
         else:
             raise ValueError("multi-input expressions require a mapping action")
-        with np.errstate(all="raise"):
+        with np.errstate(over="raise", divide="raise", invalid="raise"):
             return np.asarray(numerical(*inputs, *theta), dtype=float)
 
     structure = sp.sstr(canonical)
@@ -247,6 +246,11 @@ def evaluate_recovery(
     except ImportError as error:  # pragma: no cover - depends on installation extras
         raise RuntimeError("structural recovery requires scipy") from error
 
+    # Truth that needs the signed transform is a configuration error, reported
+    # before fitting; later transform failures come from visited parameters.
+    for target in (*fit_truth, *holdout_truth):
+        _transform(np.asarray(target, dtype=float), signed_log1p)
+
     prior = candidate.prior
     if prior.dimension == 0:
         parameters = np.empty(0, dtype=float)
@@ -261,15 +265,23 @@ def evaluate_recovery(
     budget, remainder = divmod(max_evaluations, starts)
     best = None
     for index, start in enumerate(initial):
-        result = least_squares(
-            residuals, np.asarray(start), args=(fit_actions, fit_truth),
-            bounds=(prior.lower, prior.upper), max_nfev=budget + (index < remainder),
-        )
-        score = float(np.mean(residuals(result.x, fit_actions, fit_truth) ** 2))
-        if best is None or score < best[0]:
+        try:
+            result = least_squares(
+                residuals, np.asarray(start), args=(fit_actions, fit_truth),
+                bounds=(prior.lower, prior.upper), max_nfev=budget + (index < remainder),
+            )
+            score = float(np.mean(residuals(result.x, fit_actions, fit_truth) ** 2))
+        except (ValueError, ArithmeticError):
+            # The optimizer visited parameters where the law is undefined.
+            continue
+        if np.isfinite(score) and (best is None or score < best[0]):
             best = (score, np.array(result.x, copy=True))
-    assert best is not None
+    if best is None:
+        raise ValueError("no refit start produced finite residuals")
     parameters = best[1]
-    heldout = residuals(parameters, holdout_actions, holdout_truth)
+    try:
+        heldout = residuals(parameters, holdout_actions, holdout_truth)
+    except ArithmeticError as error:
+        raise ValueError(f"refit parameters are undefined on the holdout grid: {error}") from None
     rmsle = float(np.sqrt(np.mean(heldout**2)))
     return parameters, rmsle, bool(rmsle < tolerance)

@@ -87,3 +87,23 @@ def test_recovery_measures_force_without_training_or_hidden_fields():
     assert result["recovered"] and result["rmsle"] < 1e-7
     assert not env.evaluate_model(wrong)["recovered"]
     assert env.initial_data == [] and not env.executor.clean
+
+
+def test_force_proposer_drops_invalid_laws_but_keeps_their_valid_siblings():
+    from mda.benchmarks.physics import ForceProposer
+    from mda.types import Datum
+
+    hypotheses = [
+        {"name": "divides", "expr": "a*qi*qj/r + 1/0", "params": [{"name": "a", "low": 0.1, "high": 2.0}]},
+        {"name": "overflows", "expr": "a*qi*qj/r*10.0**400", "params": [{"name": "a", "low": 0.1, "high": 2.0}]},
+        {"name": "fine", "expr": "a*qi*qj/r", "params": [{"name": "a", "low": 0.1, "high": 2.0}]},
+    ]
+
+    class Client:
+        def ask_json(self, system, prompt, **kwargs):
+            return {"hypotheses": hypotheses}
+
+    action = {"p1": 1, "p2": 2, "pos2": [3, 0], "velocity2": [0, 0], "measurement_times": [.5, 1.]}
+    models = ForceProposer(Client()).propose(
+        context="", dataset=[Datum(action, np.zeros((2, 2)))], current_models=[], residuals=[], count=3)
+    assert [m.name for m in models] == ["fine"]

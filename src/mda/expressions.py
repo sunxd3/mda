@@ -39,11 +39,14 @@ _FUNCTIONS = {
     "sqrt": np.sqrt,
     "tan": np.tan,
     "tanh": np.tanh,
-    "where": np.where,
     "k0": _scipy_special("k0"),
     "k1": _scipy_special("k1"),
     "gamma": _scipy_special("gamma"),
 }
+# Positional argument counts. Extra positional arguments would otherwise reach
+# a ufunc's ``out`` slot and let an expression overwrite the caller's arrays.
+_ARITY = {name: getattr(fn, "nin", 1) for name, fn in _FUNCTIONS.items()}
+_RAISE_ERRORS = {"over": "raise", "divide": "raise", "invalid": "raise", "under": "ignore"}
 _ALLOWED_NODES = (
     ast.Expression,
     ast.BinOp,
@@ -61,6 +64,127 @@ _ALLOWED_NODES = (
     ast.UAdd,
     ast.USub,
 )
+
+
+def _validate_tree(tree: ast.AST, allowed_names: set[str], functions: Mapping[str, Any]) -> None:
+    for node in ast.walk(tree):
+        if not isinstance(node, _ALLOWED_NODES):
+            raise ValueError(f"unsupported expression syntax: {type(node).__name__}")
+        if isinstance(node, ast.Name) and node.id not in allowed_names:
+            raise ValueError(f"undeclared name {node.id!r}")
+        if isinstance(node, ast.Call):
+            if not isinstance(node.func, ast.Name) or node.func.id not in functions:
+                raise ValueError("only approved numerical functions may be called")
+            if node.keywords:
+                raise ValueError("keyword arguments are not allowed in expressions")
+            if len(node.args) != _ARITY[node.func.id]:
+                raise ValueError(f"{node.func.id} takes {_ARITY[node.func.id]} argument(s)")
+        if isinstance(node, ast.Constant) and (
+            isinstance(node.value, bool) or not isinstance(node.value, (int, float))
+        ):
+            raise ValueError("only numerical constants are allowed")
+
+
+def _compile_tree(tree: ast.AST, filename: str):
+    """Compile a validated tree with float constants, failing cleanly on depth.
+
+    Integer literals are evaluated in arbitrary precision by Python, so a
+    constant such as ``9**9**8`` would stall the screening of an LLM proposal;
+    floats overflow instead, which the callers already treat as invalid.
+    """
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, int):
+            node.value = float(node.value)
+    try:
+        return compile(ast.fix_missing_locations(tree), filename, "eval")
+    except (RecursionError, MemoryError, SyntaxError, ValueError) as error:
+        raise ValueError(f"malformed expression: {error}") from None
+
+
+def compile_expressions(
+    expressions: Sequence[str],
+    names: Sequence[str],
+    functions: Sequence[str] | None = None,
+):
+    """Compile whitelisted expressions into one evaluator of a name mapping.
+
+    The evaluator takes ``{name: array}`` and returns a tuple of arrays, one per
+    expression, broadcast by NumPy. Floating-point errors are not raised; the
+    caller checks finiteness. ``functions`` restricts the callable subset.
+    """
+    names = tuple(names)
+    allowed = dict(_FUNCTIONS) if functions is None else {name: _FUNCTIONS[name] for name in functions}
+    if any(not name.isidentifier() or keyword.iskeyword(name) for name in names):
+        raise ValueError("names must be valid Python identifiers")
+    if len(set(names)) != len(names) or set(names) & (set(_FUNCTIONS) | {"pi", "e"}):
+        raise ValueError("names must be unique and cannot shadow functions or constants")
+    if not expressions:
+        raise ValueError("at least one expression is required")
+    trees = []
+    for expression in expressions:
+        if not isinstance(expression, str) or not expression.strip():
+            raise ValueError("expressions must be nonempty strings")
+        tree = _parse(expression.strip())
+        _validate_tree(tree, set(names) | set(allowed) | {"pi", "e"}, allowed)
+        trees.append(tree.body)
+    code = _compile_tree(ast.Expression(ast.Tuple(trees, ast.Load())), "<mda-expressions>")
+
+    def evaluate(values: Mapping[str, Any]) -> tuple[np.ndarray, ...]:
+        environment = {**allowed, "pi": np.pi, "e": np.e,
+                       **{name: np.asarray(value, dtype=float) for name, value in values.items()}}
+        with np.errstate(all="ignore"):
+            return tuple(np.asarray(value, dtype=float) for value in eval(code, {"__builtins__": {}}, environment))
+
+    return evaluate
+
+
+def _parse(expression: str) -> ast.Expression:
+    """Parse untrusted text, reporting malformed syntax as ValueError."""
+    try:
+        return ast.parse(expression, mode="eval")
+    except (SyntaxError, RecursionError, MemoryError) as error:
+        raise ValueError(f"malformed expression: {error}") from None
+
+
+def canonical_expression(expression: str) -> str:
+    """Whitespace- and parenthesis-normalized text, for duplicate detection.
+
+    ``a * x`` and ``(a*x)`` denote one structure; comparing raw text would
+    admit both as separate models, splitting weight and spending cap slots.
+    """
+    if not isinstance(expression, str):
+        raise ValueError("expressions must be strings")
+    try:
+        return ast.unparse(_parse(expression.strip()))
+    except RecursionError:
+        raise ValueError("malformed expression: too deeply nested") from None
+
+
+def screen_candidate(
+    model: CandidateModel,
+    dataset: Sequence[Datum],
+    *,
+    draws: int = 4,
+    actions: int = 3,
+    seed: int = 0,
+) -> bool:
+    """Whether a proposed law can be evaluated somewhere on its prior.
+
+    Each of ``draws`` fixed prior samples is run on up to ``actions`` observed
+    experiments; the law is kept if any draw gives finite predictions on all of
+    them. Screening at a single draw rejected laws that are valid on most of
+    their prior (``k*sqrt(x - x0)`` with ``x0`` near the data), while a law that
+    fails at every draw cannot be fitted and is dropped as v5 requires.
+    """
+    rng = np.random.default_rng(seed)
+    for theta in model.prior.sample(rng, max(1, draws)):
+        try:
+            for datum in dataset[:actions]:
+                model.observation_prediction(theta, datum.action)
+        except (KeyError, TypeError, ValueError, ArithmeticError, RuntimeError):
+            continue
+        return True
+    return False
 
 
 def compile_expression(
@@ -83,21 +207,9 @@ def compile_expression(
     if set(declared) & reserved:
         raise ValueError("variable and parameter names cannot shadow functions or constants")
 
-    tree = ast.parse(expression, mode="eval")
-    allowed_names = set(declared) | reserved
-    for node in ast.walk(tree):
-        if not isinstance(node, _ALLOWED_NODES):
-            raise ValueError(f"unsupported expression syntax: {type(node).__name__}")
-        if isinstance(node, ast.Name) and node.id not in allowed_names:
-            raise ValueError(f"undeclared name {node.id!r}")
-        if isinstance(node, ast.Call):
-            if not isinstance(node.func, ast.Name) or node.func.id not in _FUNCTIONS:
-                raise ValueError("only approved numerical functions may be called")
-            if node.keywords:
-                raise ValueError("keyword arguments are not allowed in expressions")
-        if isinstance(node, ast.Constant) and not isinstance(node.value, (int, float)):
-            raise ValueError("only numerical constants are allowed")
-    code = compile(tree, "<mda-expression>", "eval")
+    tree = _parse(expression)
+    _validate_tree(tree, set(declared) | reserved, _FUNCTIONS)
+    code = _compile_tree(tree, "<mda-expression>")
 
     def evaluate(theta: np.ndarray, action: Any) -> np.ndarray:
         if isinstance(action, Mapping):
@@ -110,10 +222,11 @@ def compile_expression(
             **_FUNCTIONS,
             "pi": np.pi,
             "e": np.e,
-            **variables,
+            **{name: np.asarray(value, dtype=float) for name, value in variables.items()},
             **dict(zip(parameter_names, np.asarray(theta, dtype=float), strict=True)),
         }
-        with np.errstate(all="raise"):
+        # Underflow is a harmless tiny value, not an invalid law.
+        with np.errstate(**_RAISE_ERRORS):
             return np.asarray(eval(code, {"__builtins__": {}}, environment), dtype=float)
 
     return evaluate
@@ -273,7 +386,7 @@ scientifically plausible uniform-prior bounds. Return JSON only."""
                     np.asarray([parameter["low"] for parameter in item["params"]]),
                     np.asarray([parameter["high"] for parameter in item["params"]]),
                 )
-                expression = item["expr"].strip()
+                expression = canonical_expression(item["expr"])
                 if expression in existing:
                     continue
                 predict = compile_expression(expression, self.variable_names, names)
@@ -283,10 +396,12 @@ scientifically plausible uniform-prior bounds. Return JSON only."""
                     prior=prior,
                     predict=predict,
                 )
-                for datum in dataset[:3]:
-                    model.observation_prediction(prior.sample(np.random.default_rng(0), 1)[0], datum.action)
+                if not screen_candidate(model, dataset):
+                    continue
                 models.append(model)
                 existing.add(expression)
-            except (KeyError, TypeError, ValueError):
+            except (KeyError, TypeError, ValueError, ArithmeticError):
+                # Invalid laws, including ones that overflow or divide by zero
+                # at the screening points, are dropped as v5 requires.
                 continue
         return models[:count]

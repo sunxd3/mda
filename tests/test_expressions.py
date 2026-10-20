@@ -128,3 +128,76 @@ def test_symbolic_proposer_reports_signed_input_correlations_and_full_model_pool
     assert correlations == [{
         "structure": "a*x", "input_signed_residual_correlations": {"x": -1.0}
     }]
+
+
+def test_symbolic_proposer_drops_malformed_and_overflowing_laws():
+    hypotheses = [
+        {"name": "syntax", "expr": "a*(x - ", "params": [{"name": "a", "low": 0.1, "high": 2.0}]},
+        {"name": "log zero", "expr": "a*log(y)", "params": [{"name": "a", "low": 0.1, "high": 2.0}]},
+        {"name": "valid", "expr": "a*x", "params": [{"name": "a", "low": 0.1, "high": 2.0}]},
+    ]
+
+    class Client:
+        def ask_json(self, system, prompt, **kwargs):
+            return {"hypotheses": hypotheses}
+
+    dataset = [Datum({"x": x, "y": 0.0}, np.asarray(x)) for x in (1.0, 2.0, 3.0)]
+    models = SymbolicRegressionProposer(Client(), variable_names=("x", "y")).propose(
+        context="", dataset=dataset, current_models=(), residuals=(), count=3,
+    )
+    assert [model.name for model in models] == ["valid"]
+
+
+def test_underflow_is_a_tiny_value_not_an_invalid_law():
+    fn = compile_expression("a*exp(-b*x)", ("x",), ("a", "b"))
+    value = fn(np.asarray([1.0, 740.0]), 1.0)
+    assert 0.0 <= value < 1e-300
+
+
+@pytest.mark.parametrize("expression", ["exp(r, r)", "maximum(r)", "sqrt()", "where(r)"])
+def test_calls_with_the_wrong_argument_count_are_rejected(expression):
+    # A surplus positional argument would reach a ufunc's ``out`` slot and
+    # overwrite the caller's array; ``where`` cannot be used without comparisons.
+    with pytest.raises(ValueError):
+        compile_expression(expression, ("r",), ())
+
+
+def test_integer_power_towers_overflow_immediately_instead_of_stalling():
+    import time
+
+    fn = compile_expression("9**9**9 + x", ("x",), ())
+    started = time.perf_counter()
+    with pytest.raises(OverflowError):
+        fn(np.zeros(0), 1.0)
+    assert time.perf_counter() - started < 1.0
+
+
+def test_canonical_expression_normalizes_spacing_and_parentheses():
+    from mda.expressions import canonical_expression
+
+    assert canonical_expression("a*x") == canonical_expression(" a * x ") == canonical_expression("(a*x)")
+    with pytest.raises(ValueError):
+        canonical_expression("a*(x")
+
+
+def test_screening_keeps_laws_valid_on_part_of_their_prior_and_dedupes_spacing():
+    data = [Datum({"x": x}, np.asarray(1.0)) for x in (310.0, 350.0, 390.0)]
+    hypotheses = [
+        # Valid only where x0 <= 310: one unlucky prior draw must not reject it.
+        {"name": "sqrt", "expr": "k*sqrt(x - x0)",
+         "params": [{"name": "k", "low": 0.1, "high": 2.0}, {"name": "x0", "low": 300.0, "high": 340.0}]},
+        {"name": "lin", "expr": "a*x", "params": [{"name": "a", "low": 0.0, "high": 1.0}]},
+        {"name": "lin again", "expr": "a * x", "params": [{"name": "a", "low": 0.0, "high": 1.0}]},
+        # Invalid everywhere on its prior.
+        {"name": "never", "expr": "sqrt(-x)*k", "params": [{"name": "k", "low": 0.1, "high": 2.0}]},
+    ]
+
+    class Client:
+        def ask_json(self, system, prompt, **kwargs):
+            return {"hypotheses": hypotheses}
+
+    models = SymbolicRegressionProposer(Client(), variable_names=("x",)).propose(
+        context="", dataset=data, current_models=[], residuals=[], count=4,
+    )
+    assert [m.name for m in models] == ["sqrt", "lin"]
+    assert models[1].structure == "a * x"

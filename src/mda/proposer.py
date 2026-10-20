@@ -1,4 +1,4 @@
-"""The sole LLM boundary: structure birth proposals (Algorithm 7)."""
+"""The sole LLM boundary: structure proposals (``init-hyp-space``/``expand-hyp-space``)."""
 
 from __future__ import annotations
 

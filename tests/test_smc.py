@@ -3,6 +3,7 @@ from __future__ import annotations
 from math import erf, log, pi, sqrt
 
 import numpy as np
+import pytest
 
 from mda.likelihoods import BootstrapParticleFilter, DeterministicGaussianLikelihood
 from mda.posterior import fit_model_posterior
@@ -200,6 +201,28 @@ def test_particle_filter_matches_one_step_gaussian_marginal():
     assert abs(estimate - analytic) < 0.03
 
 
+def test_particle_filter_ignores_a_diverged_particle_and_accepts_a_scalar_observation():
+    def initial(theta, action, count, rng):
+        return np.zeros((count, 1))
+
+    def transition(states, theta, action, time_index, rng):
+        moved = states + rng.normal(0, 0.7, states.shape)
+        moved[0] = np.nan  # one particle diverges at every step
+        return moved
+
+    candidate = CandidateModel(
+        "random walk",
+        UniformPrior(("unused",), np.asarray([-1.0]), np.asarray([1.0])),
+        predict=lambda theta, action: np.asarray([0.0]),
+        state_space=StateSpaceModel(initial, transition, lambda states, theta, action, time_index: states),
+    )
+    filter_ = BootstrapParticleFilter(20_000, 0.4)
+    scalar = filter_([Datum(None, np.asarray(0.3))], candidate, np.asarray([0.0]), np.random.default_rng(4))
+    total_variance = 0.7**2 + 0.4**2
+    analytic = -0.5 * (0.3**2 / total_variance + log(2 * pi * total_variance))
+    assert np.isfinite(scalar) and abs(scalar - analytic) < 0.05
+
+
 def test_nested_particle_filter_smc_model_posterior_matches_gaussian_evidence():
     process_std = 0.35
     observation_std = 0.45
@@ -304,3 +327,34 @@ def test_all_impossible_parameter_particles_return_negative_infinite_evidence():
         np.random.default_rng(5),
     )
     assert posterior.log_evidence == -np.inf
+
+
+def test_systematic_resample_never_indexes_past_the_last_particle():
+    from mda.numerics import systematic_resample
+
+    class AlmostOne:
+        def random(self):
+            return np.nextafter(1.0, 0.0)
+
+    ancestors = systematic_resample(np.full(11, 1 / 11), AlmostOne())
+    assert ancestors.max() == 10 and ancestors.min() == 0
+
+
+def test_python_division_by_zero_is_an_impossible_particle_not_a_crash():
+    def prediction(theta, action):
+        if theta[0] < 0:
+            return np.asarray(1.0 / 0.0)  # ZeroDivisionError, as ``a + 1/x`` gives at x = 0
+        return np.asarray(theta[0])
+
+    posterior = parameter_posterior(
+        [Datum(0.0, np.asarray(1.0))], model(prediction=prediction),
+        DeterministicGaussianLikelihood(0.5), SMCConfig(parameter_particles=64),
+        np.random.default_rng(3),
+    )
+    assert np.isfinite(posterior.log_evidence)
+    assert np.all(posterior.particles[posterior.weights > 0, 0] >= 0)
+
+
+def test_target_ess_fraction_one_is_unreachable_and_rejected():
+    with pytest.raises(ValueError):
+        SMCConfig(target_ess_fraction=1.0)

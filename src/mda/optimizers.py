@@ -64,6 +64,10 @@ class CMAESOptimizer:
             )
         return value
 
+    def sample(self, rng: np.random.Generator) -> Any:
+        """Draw a uniform design in the normalized (log-mapped) box."""
+        return self.decode(self._domain_vector(rng.random(self.lower.size)))
+
     def __call__(self, score: Callable[[Any], float], rng: np.random.Generator) -> Any:
         """Return the best finite-scoring action actually evaluated."""
         try:
@@ -79,24 +83,34 @@ class CMAESOptimizer:
 
         dimension = self.lower.size
         population_size = max(2, min(self.max_evaluations, 4 + int(3 * np.log(dimension))))
-        strategy = cma.CMAEvolutionStrategy(
-            np.full(dimension, 0.5),
-            0.25,
-            {
-                "bounds": [0.0, 1.0],
-                "popsize": population_size,
-                "randn": randn,
-                "seed": np.nan,
-                "verbose": -9,
-                "verb_disp": 0,
-                "verb_log": 0,
-            },
-        )
+        # The evaluation budget is the only intended stopping rule: a nearly
+        # flat score (a concentrated model posterior) would otherwise trip
+        # cma's tolerance tests after a single generation.
+        options = {
+            "bounds": [0.0, 1.0],
+            "popsize": population_size,
+            "randn": randn,
+            "seed": np.nan,
+            "verbose": -9,
+            "verb_disp": 0,
+            "verb_log": 0,
+            "tolfun": 0.0,
+            "tolfunhist": 0.0,
+            "tolfunrel": 0.0,
+            "tolx": 0.0,
+            "tolflatfitness": self.max_evaluations,
+            "tolstagnation": self.max_evaluations,
+        }
+        strategy = cma.CMAEvolutionStrategy(np.full(dimension, 0.5), 0.25, options)
 
         best_action: Any = None
         best_score = -np.inf
         evaluated = 0
-        while evaluated < self.max_evaluations and not strategy.stop():
+        while evaluated < self.max_evaluations:
+            if strategy.stop():
+                # Any remaining stop (e.g. numerical degeneracy) restarts from a
+                # random point so the full budget is still spent.
+                strategy = cma.CMAEvolutionStrategy(local_rng.random(dimension), 0.25, options)
             count = min(population_size, self.max_evaluations - evaluated)
             candidates = strategy.ask(number=count)
             losses: list[float] = []

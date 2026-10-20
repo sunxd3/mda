@@ -1,4 +1,11 @@
-"""Deterministic NeuronBench adapter using the paper's data and proposal contracts.
+"""Deterministic NeuronBench adapter using the v4 paper's data and proposal contracts.
+
+v5 drops the deterministic benchmark (its ODE is only a model arm fitted to
+stochastic data), so ``NeuronBenchEnvironment`` and its Table 14 noise model and
+brief/long-step D0 are v4 legacy. It is scored, like the stochastic adapter,
+with v5's fixed-scale feature metric: v4's Eq. 1 divides by a query variance
+that is zero for n_pre on most released test sets. The proposer and channel
+candidates are shared with the stochastic adapter.
 
 The released benchmark remains the source of truth for protocols and HH simulation.
 This module supplies the missing agent/environment glue without reading its private
@@ -20,6 +27,10 @@ from .openai_client import OpenAIJSONClient
 from .types import CandidateModel, Datum, UniformPrior
 
 
+# v5 Eq. hhFixedScaleMSE scales for [n_test, n_pre, run_down, adaptation, V_min, V_end].
+FEATURE_SCALES = np.array([3.0, 3.0, 3.0, 3.0, 12.0, 8.0])
+
+
 def _neuronbench():
     try:
         import neuronbench as nb
@@ -38,6 +49,20 @@ def _test_start(protocol) -> int:
 
 def trace_features(trace: np.ndarray, protocol) -> np.ndarray:
     return _neuronbench().evaluator.eval_features(np.asarray(trace), _test_start(protocol))
+
+
+def fixed_scale_feature_mse(targets, query_actions, predictor) -> float:
+    """v5 Eq. hhFixedScaleMSE against upstream ``held_out_feature_targets``."""
+    truth = np.stack([targets[p[0]][0] for p in query_actions])
+    forecast = np.stack([np.asarray(predictor(p), float) for p in query_actions])
+    if forecast.shape != truth.shape:
+        raise ValueError("predictor features must match held-out feature shape")
+    return float(np.mean(((forecast - truth) / FEATURE_SCALES) ** 2))
+
+
+def _canonical_float(value) -> float:
+    # JSON ints, NumPy scalars and -0.0 must not give one structure two keys.
+    return float(value) + 0.0
 
 
 def _slow_na_trace(current: np.ndarray, g_leak: float, depolarized_tau_ms: float) -> np.ndarray:
@@ -100,8 +125,22 @@ class NeuronHypothesis:
     activation_tau_ms: float = 1.0
 
     def __post_init__(self) -> None:
+        for name in (
+            "reversal_mv", "activation_slope_mv", "inactivation_half_mv",
+            "inactivation_slope_mv", "inactivation_tau_ms", "activation_tau_ms",
+        ):
+            object.__setattr__(self, name, _canonical_float(getattr(self, name)))
+        for name in ("g_bounds", "half_mv_bounds", "tau_ms_bounds"):
+            object.__setattr__(
+                self, name, tuple(_canonical_float(value) for value in getattr(self, name))
+            )
+        power = _canonical_float(self.activation_power)
+        object.__setattr__(self, "activation_power", int(power) if power.is_integer() else power)
         if self.mechanism_type not in {"channel", "slow_na"}:
             raise ValueError("mechanism_type must be channel or slow_na")
+        if self.mechanism_type == "slow_na":
+            # Its gL/tau_s_ms priors are fixed and it ignores every channel field.
+            return
         if self.opens_on not in {"depol", "hyperpol"}:
             raise ValueError("opens_on must be depol or hyperpol")
         if self.tau_gate not in {"activation", "inactivation"}:
@@ -111,8 +150,14 @@ class NeuronHypothesis:
         for bounds in (self.g_bounds, self.half_mv_bounds, self.tau_ms_bounds):
             if len(bounds) != 2 or not np.isfinite(bounds).all() or bounds[0] >= bounds[1]:
                 raise ValueError("all neuron parameter bounds must be finite and ordered")
-        if self.activation_power < 1 or self.activation_slope_mv <= 0:
-            raise ValueError("activation power and slope magnitude must be positive")
+        if self.g_bounds[0] < 0 or self.tau_ms_bounds[0] <= 0:
+            raise ValueError("conductance bounds must be nonnegative and tau bounds positive")
+        if (
+            not isinstance(self.activation_power, int)
+            or self.activation_power < 1
+            or self.activation_slope_mv <= 0
+        ):
+            raise ValueError("activation power must be a positive integer and slope positive")
         if not np.isfinite(self.activation_tau_ms) or self.activation_tau_ms <= 0:
             raise ValueError("fixed activation tau must be positive and finite")
         if self.inactivates and (
@@ -257,7 +302,7 @@ def evaluate_neuron_recovery(world_name: str, model: CandidateModel, parameters:
 
 
 class NeuronBenchEnvironment:
-    """Algorithm 1 environment facade with the paper's fixed two-protocol D0."""
+    """v4 Algorithm 1 environment facade with its fixed brief/long-step D0."""
 
     def __init__(self, world_name: str, *, seed: int = 0) -> None:
         nb = _neuronbench()
@@ -291,19 +336,17 @@ class NeuronBenchEnvironment:
         return np.maximum(0.12 * np.abs(prediction), 3.0)
 
     def evaluate_predictor(self, predictor) -> float:
-        """Evaluate Eq. 1 on held-out queries, separately from training data."""
-        truth = np.stack([
-            trace_features(self.world.run(action).voltage, action)
-            for action in self.query_actions
-        ])
-        forecast = np.stack([np.asarray(predictor(action), dtype=float) for action in self.query_actions])
-        if forecast.shape != truth.shape:
-            raise ValueError("predictor features must match held-out feature shape")
-        query_variance = np.var(truth, axis=0)
-        if np.any(query_variance == 0):
-            raise ValueError("Eq. 1 is undefined for zero query variance")
-        component_mse = np.mean((forecast - truth) ** 2, axis=0)
-        return float(np.mean(component_mse / query_variance))
+        """v5 Eq. hhFixedScaleMSE on held-out queries, separately from training data.
+
+        v5 scores both HH arms with this metric. v4's Eq. 1 is undefined here:
+        n_pre has zero query variance on four of the six released test sets.
+        References are upstream's features of each query's full-resolution
+        deterministic true trace.
+        """
+        targets = _neuronbench().evaluator.held_out_feature_targets(
+            self.world_name, stochastic=False
+        )
+        return fixed_scale_feature_mse(targets, self.query_actions, predictor)
 
     def step(self, protocol) -> np.ndarray:
         return self.world.run(protocol).voltage
@@ -432,6 +475,6 @@ Na inactivation, use the fixed bounds gL in [0.2, 0.45] and depolarized tau_s_ms
                 if candidate.key not in existing:
                     models.append(candidate)
                     existing.add(candidate.key)
-            except (TypeError, ValueError):
+            except (KeyError, TypeError, ValueError):
                 continue
         return models[:count]

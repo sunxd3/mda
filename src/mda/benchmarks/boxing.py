@@ -93,8 +93,9 @@ class BoxingEnvironment:
                  query_count: int = 12):
         if domain not in DOMAINS:
             raise ValueError(f"domain must be one of {DOMAINS}")
-        if candidate_count < 2 or query_count < 1:
-            raise ValueError("candidate_count >= 2 and query_count >= 1 are required")
+        seed_count = 3 if domain == "location" else 2
+        if candidate_count < seed_count or query_count < 1:
+            raise ValueError(f"candidate_count >= {seed_count} and query_count >= 1 are required")
         self.domain, self.seed = domain, seed
         latent_rng = np.random.default_rng(np.random.SeedSequence([seed, 0]))
         action_rng = np.random.default_rng(np.random.SeedSequence([seed, 1]))
@@ -119,7 +120,6 @@ class BoxingEnvironment:
             all_actions = list(range(len(all_actions)))
         else:
             self.action_features = np.asarray(all_actions, dtype=object)
-        seed_count = 3 if domain == "location" else 2
         seed_actions = all_actions[:seed_count]
         self.actions = list(all_actions[:candidate_count])
         self.query_actions = list(all_actions[candidate_count:requested])
@@ -273,15 +273,19 @@ class _NumPyroProposer:
             import jax.numpy as jnp
             import numpyro
             import numpyro.distributions as dist
-            compiled = compile_numpyro_source(entry["source"], self.env.action_features,
-                                               allow_code_execution=self.allow,
-                                               namespace={"numpyro": numpyro, "dist": dist,
-                                                          "jax": jax, "jnp": jnp, "np": np},
-                                               name=str(entry.get("name", "numpyro")))
+            try:
+                compiled = compile_numpyro_source(entry["source"], self.env.action_features,
+                                                  allow_code_execution=self.allow,
+                                                  namespace={"numpyro": numpyro, "dist": dist,
+                                                             "jax": jax, "jnp": jnp, "np": np},
+                                                  name=str(entry.get("name", "numpyro")))
+            except (KeyError, TypeError, ValueError, SyntaxError, ArithmeticError, RuntimeError):
+                # One malformed program is dropped; its valid siblings stay.
+                continue
             # The backend consumes feature matrices; the benchmark action is a
             # row index so query features cannot accidentally be omitted.
             def predict(theta, index, candidate=compiled, table=self.env.action_features):
-                return np.asarray(candidate.predict(theta, table)).reshape(-1)[int(index)]
+                return np.asarray(candidate.predict(theta, table))[int(index)]
             result.append(CandidateModel(compiled.name, compiled.prior, predict,
                                          structure=entry["source"], metadata=compiled.metadata))
         return result

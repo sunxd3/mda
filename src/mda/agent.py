@@ -1,8 +1,8 @@
-"""The stateful Model Discovery Agent loop (paper Algorithm 2)."""
+"""The stateful Model Discovery Agent loop (paper Algorithm 2, ``alg:mda`` in v5)."""
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -10,10 +10,28 @@ import numpy as np
 
 from .acquisition import choose_design, value_of_information
 from .checks import TargetFn, identity_target, in_sample_check, predictive_check, residual_report
+from .evidence import EvidenceBackend
 from .posterior import BeliefState, fit_model_posterior
 from .proposer import ModelProposer
 from .smc import Likelihood, SMCConfig
 from .types import CandidateModel, Datum
+
+
+def default_action_key(action: Any) -> str:
+    """Exact text key for an experiment.
+
+    ``repr`` of an array keeps eight significant digits, elides long arrays
+    and follows the global print options, so distinct designs could collide
+    in ``used_action_keys`` and in the optimizer's evaluation table.
+    """
+    if isinstance(action, np.ndarray):
+        return f"ndarray{action.shape}{action.dtype}:{action.tobytes().hex()}"
+    if isinstance(action, Mapping):
+        items = sorted(action.items(), key=lambda item: repr(item[0]))
+        return "{" + ", ".join(f"{key!r}: {default_action_key(value)}" for key, value in items) + "}"
+    if isinstance(action, (list, tuple)):
+        return f"{type(action).__name__}({', '.join(default_action_key(value) for value in action)})"
+    return repr(action)
 
 
 @dataclass(frozen=True)
@@ -23,14 +41,17 @@ class AgentConfig:
     model_search_rounds: int = 2
     expansion_cap: int = 4
     error_threshold: float = 0.05
-    occam_penalty: float = 2.0
+    occam_penalty: float = 0.0
     predictive_floor: float | np.ndarray = 1e-6
     backtest: bool = True
     design_flavour: str = "model"
     repeat_designs: bool = False
     smc: SMCConfig = field(default_factory=SMCConfig)
     minimum_model_cap: int | None = None
-    shrink_confidence: float = 0.95
+    shrink_confidence: float = 0.9
+    initial_proposals: int = 0
+    expansion_gate: str = "prequential"
+    repeat_when_exhausted: bool = False
 
     def __post_init__(self) -> None:
         if self.model_cap < 1 or self.new_models_per_expansion < 1:
@@ -45,13 +66,20 @@ class AgentConfig:
             raise ValueError("minimum_model_cap must be between 1 and model_cap")
         if not 0 < self.shrink_confidence <= 1:
             raise ValueError("shrink_confidence must be in (0, 1]")
+        if self.initial_proposals < 0:
+            raise ValueError("initial_proposals cannot be negative")
+        if self.expansion_gate not in {"prequential", "cached"}:
+            raise ValueError("expansion_gate must be prequential or cached")
 
 
 class ModelDiscoveryAgent:
-    """Full-batch M-open SMC model discovery with value-of-information design.
+    """M-open model discovery with value-of-information design.
 
     The LLM is used only by ``proposer``. Every weight, evidence, design score,
     and prediction is numerical, preserving the paper's core division of labor.
+    ``evidence`` selects the per-structure evidence backend: full-history
+    tempered SMC with ``config.smc`` by default, or e.g. ``BICEvidence`` or
+    ``RecursiveEvidence`` from :mod:`mda.evidence`.
     """
 
     def __init__(
@@ -71,10 +99,14 @@ class ModelDiscoveryAgent:
         task_noise_covariance: float | np.ndarray | None = None,
         optimizer: Callable[[Callable[[Any], float], np.random.Generator], Any] | None = None,
         experiment_budget: int | None = None,
-        action_key: Callable[[Any], str] = repr,
+        action_key: Callable[[Any], str] = default_action_key,
+        evidence: EvidenceBackend | None = None,
+        check: Callable[[BeliefState, Datum, Sequence[Datum]], float] | None = None,
         seed: int = 0,
     ) -> None:
         self.context = context
+        self.evidence = evidence
+        self.check = check
         self.dataset = list(initial_data)
         self.likelihood = likelihood
         self.actions = list(actions)
@@ -92,33 +124,47 @@ class ModelDiscoveryAgent:
         self.experiments_run = 0
         self.active_model_cap = config.model_cap
         self.action_key = action_key
+        self.seed = seed
         self.rng = np.random.default_rng(seed)
         self.expansion_count = 0
-        self.used_action_keys = {action_key(datum.action) for datum in initial_data}
+        self.used_action_keys = {action_key(datum.action) for datum in self.dataset}
+        if config.design_flavour in {"task", "task_full_observation"} and not self.query_actions:
+            raise ValueError("task value of information needs query_actions")
         self.last_design_scores: np.ndarray | None = None
         self.last_predictive_error: float | None = None
 
+        # init-hyp-space: a configured seed library plus, optionally, one LLM
+        # batch conditioned only on the context and D0, merged without duplicates.
         models = list(initial_models)
-        if not models:
-            if proposer is None:
-                raise ValueError("initial_models cannot be empty without a proposer")
-            models = proposer.propose(
+        if not models and proposer is None:
+            raise ValueError("initial_models cannot be empty without a proposer")
+        if proposer is not None and (not models or config.initial_proposals):
+            keys = {model.key for model in models}
+            for proposal in proposer.propose(
                 context=self._proposal_context(),
                 dataset=self.dataset,
                 current_models=(),
                 residuals=(),
-                count=config.model_cap,
-            )
+                count=config.initial_proposals or config.model_cap,
+            ):
+                if proposal.key not in keys:
+                    models.append(proposal)
+                    keys.add(proposal.key)
         if not models:
             raise ValueError("the proposer returned no valid initial models")
+        # v5 Algorithm 2 applies adapt-and-prune only at the end of updates.
         self.belief = self._fit(models)
-        self._adapt_pool()
 
     @property
     def models(self) -> tuple[CandidateModel, ...]:
         return tuple(fit.model for fit in self.belief.fits)
 
-    def _fit(self, models: Sequence[CandidateModel]) -> BeliefState:
+    def _fit(self, models: Sequence[CandidateModel], *, reuse: bool = False) -> BeliefState:
+        """Model posterior on the current data.
+
+        With ``reuse`` the current fits are kept for their structures; this is
+        valid only when they were computed on exactly ``self.dataset``.
+        """
         return fit_model_posterior(
             self.dataset,
             models,
@@ -127,6 +173,8 @@ class ModelDiscoveryAgent:
             model_cap=self.active_model_cap,
             occam_penalty=self.config.occam_penalty,
             rng=self.rng,
+            evidence=self.evidence,
+            reuse={fit.model.key: fit.parameters for fit in self.belief.fits} if reuse else None,
         )
 
     def _proposal_context(self) -> str:
@@ -136,13 +184,18 @@ class ModelDiscoveryAgent:
         return f"{self.context}\n\n{status}"
 
     def _adapt_pool(self) -> None:
-        """Optional Appendix B.3 gates; confidence cutoff is a local choice."""
+        """Optional ``adapt-and-prune``: shrink only if MAP weight and fit both pass.
+
+        v5 ChemBench shrinks to 6 when the largest weight exceeds 0.9 and the
+        median relative fit residual is at most 0.05; otherwise the cap is the
+        full ``model_cap``. Raising the cap does not restore pruned models.
+        """
         if self.config.minimum_model_cap is None:
             return
         error = in_sample_check(
             self.belief, self.dataset, target=self.target, floor=self.config.predictive_floor,
         )
-        confident = self.belief.model_weights[self.belief.map_index] >= self.config.shrink_confidence
+        confident = self.belief.model_weights[self.belief.map_index] > self.config.shrink_confidence
         self.active_model_cap = (
             self.config.minimum_model_cap
             if confident and error <= self.config.error_threshold else self.config.model_cap
@@ -160,11 +213,24 @@ class ModelDiscoveryAgent:
     def available_actions(self) -> list[Any]:
         if self.config.repeat_designs:
             return list(self.actions)
-        return [action for action in self.actions if self.action_key(action) not in self.used_action_keys]
+        unused = [action for action in self.actions if self.action_key(action) not in self.used_action_keys]
+        if not unused and self.config.repeat_when_exhausted:
+            return list(self.actions)
+        return unused
+
+    def random_design_rng(self) -> np.random.Generator:
+        """A generator that depends only on the seed, not on inference.
+
+        Random-design controls drawn from it share their design history across
+        inference arms, as v5's ChemBench controls require.
+        """
+        return np.random.default_rng(np.random.SeedSequence([self.seed, 0xD5]))
 
     def design(self) -> Any:
         if self.experiment_budget is not None and self.experiments_run >= self.experiment_budget:
             raise ValueError("the experiment budget is exhausted")
+        if self.config.design_flavour in {"task", "task_full_observation"} and not self.query_actions:
+            raise ValueError("task value of information needs query_actions")
         options = dict(
             flavour=self.config.design_flavour,
             observation_covariance=(
@@ -201,78 +267,129 @@ class ModelDiscoveryAgent:
     def update_state(self, action: Any, observation: np.ndarray) -> float:
         """Absorb one result, expanding only after a failed prequential check.
 
-        Algorithm 2 prints the append before Algorithm 8's pre-observation check.
-        We evaluate and cache that check first, which is the ordering required by
-        the surrounding text and prevents leakage from the fresh outcome.
+        Follows v5 Algorithm 2: score the fresh datum against the pre-update
+        belief, append it, refit the current pool on all data, and only then
+        run up to ``model_search_rounds`` expansions. Proposals therefore see
+        residuals of the refitted pool. Each re-judge refits only the new
+        structures; the others keep their fits on this same dataset.
+
+        ``expansion_gate="cached"`` instead gates the first expansion on the
+        in-sample residuals of the preceding fit, as v5's executed ChemBench
+        agent does, so a surprising datum can trigger expansion one update
+        later. The returned value is always the prequential error.
         """
         fresh = Datum(action, observation)
-        error = predictive_check(
-            self.belief,
-            fresh,
-            self.dataset,
-            target=self.target,
-            floor=self.config.predictive_floor,
-            backtest=self.config.backtest,
-        )
+        error = self._check(fresh)
         self.last_predictive_error = error
+        gate_error = error if self.config.expansion_gate == "prequential" else in_sample_check(
+            self.belief, self.dataset, target=self.target, floor=self.config.predictive_floor,
+        )
+        key = self.action_key(action)
+        key_was_used = key in self.used_action_keys
+        previous_cap = self.active_model_cap
         self.dataset.append(fresh)
-        self.used_action_keys.add(self.action_key(action))
+        self.used_action_keys.add(key)
         self.experiments_run += 1
-        if error > self.config.error_threshold:
+        if gate_error > self.config.error_threshold:
             self.active_model_cap = self.config.model_cap
+        try:
+            belief = self._fit(self.models)
+        except Exception:
+            # Leave the agent exactly as it was, so that the failure can be
+            # reported and a retry does not absorb the datum twice.
+            self.dataset.pop()
+            if not key_was_used:
+                self.used_action_keys.discard(key)
+            self.experiments_run -= 1
+            self.active_model_cap = previous_cap
+            raise
+        self.belief = belief
 
-        expanded = False
-        check_error = error
-        for _ in range(self.config.model_search_rounds):
-            if check_error <= self.config.error_threshold:
-                break
-            if self.expansion_count >= self.config.expansion_cap or self.proposer is None:
-                break
-            reports = [
-                residual_report(
-                    fit,
-                    self.dataset,
-                    target=self.target,
-                    floor=self.config.predictive_floor,
+        check_error = gate_error
+        try:
+            for _ in range(self.config.model_search_rounds):
+                if check_error <= self.config.error_threshold or not self._expand():
+                    break
+                check_error = (
+                    in_sample_check(
+                        self.belief,
+                        self.dataset if self.config.backtest else [fresh],
+                        target=self.target,
+                        floor=self.config.predictive_floor,
+                    )
+                    if self.check is None else self.check(self.belief, fresh, self.dataset[:-1])
                 )
-                for fit in self.belief.fits
-            ]
-            proposals = self.proposer.propose(
-                context=self._proposal_context(),
-                dataset=self.dataset,
-                current_models=self.models,
-                residuals=reports,
-                count=self.config.new_models_per_expansion,
-            )
-            existing_keys = {model.key for model in self.models}
-            novel = []
-            for proposal in proposals:
-                if proposal.key not in existing_keys:
-                    novel.append(proposal)
-                    existing_keys.add(proposal.key)
-            if not novel:
-                break
-            self.belief = self._fit([*self.models, *novel])
-            self.expansion_count += 1
-            expanded = True
-            check_error = in_sample_check(
+        finally:
+            # The refitted pool is consistent with the data even if a proposer
+            # call failed part-way; keep the cap bookkeeping in step with it.
+            self._adapt_pool()
+        return error
+
+    def _check(self, fresh: Datum) -> float:
+        """Pre-update adequacy of the current belief on a fresh datum.
+
+        The default is the paper's relative-residual ``predictive-check``; a
+        domain may supply ``check(belief, fresh, history)`` instead, compared
+        against the same ``error_threshold``.
+        """
+        try:
+            if self.check is not None:
+                return float(self.check(self.belief, fresh, self.dataset))
+            return predictive_check(
                 self.belief,
-                self.dataset if self.config.backtest else [fresh],
+                fresh,
+                self.dataset,
+                target=self.target,
+                floor=self.config.predictive_floor,
+                backtest=self.config.backtest,
+            )
+        except (ValueError, ArithmeticError):
+            # The current best model cannot even evaluate this experiment
+            # (a domain error at the chosen design): the check fails rather
+            # than aborting after the experiment has already been run.
+            return np.inf
+
+    def _expand(self) -> bool:
+        """One ``expand-hyp-space`` call and re-judge; False if no call was allowed.
+
+        As in v5 Algorithm 2, every call counts toward ``expansion_cap``
+        (N_e^max), including one whose proposals are all invalid or duplicates;
+        the search then continues with the next round.
+        """
+        if self.expansion_count >= self.config.expansion_cap or self.proposer is None:
+            return False
+        reports = [
+            residual_report(
+                fit,
+                self.dataset,
                 target=self.target,
                 floor=self.config.predictive_floor,
             )
-
-        if not expanded:
-            self.belief = self._fit(self.models)
-        self._adapt_pool()
-        return error
+            for fit in self.belief.fits
+        ]
+        proposals = self.proposer.propose(
+            context=self._proposal_context(),
+            dataset=self.dataset,
+            current_models=self.models,
+            residuals=reports,
+            count=self.config.new_models_per_expansion,
+        )
+        self.expansion_count += 1
+        existing_keys = {model.key for model in self.models}
+        novel = []
+        for proposal in proposals:
+            if proposal.key not in existing_keys:
+                novel.append(proposal)
+                existing_keys.add(proposal.key)
+        if novel:
+            self.belief = self._fit([*self.models, *novel], reuse=True)
+        return True
 
     def get_model(self) -> CandidateModel:
-        """Current-data Occam-MAP, not a winner selected using held-out truth.
+        """Current-data MAP structure, as in v5 Algorithm 2.
 
-        Algorithm 2's 'over any round' rule is unspecified; historical posterior
-        masses have different normalizers and are not comparable. Best-so-far
-        held-out curves belong in the evaluator, never in this selection step.
+        Never a winner selected using held-out truth: best-so-far held-out
+        curves belong in the evaluator, not in this selection step.
         """
         return self.belief.map_fit.model
 

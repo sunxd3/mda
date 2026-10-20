@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "model-discovery-agent"
 version = "0.1.0"
-description = "A paper-faithful implementation of the Model Discovery Agent and SMC^3"
+description = "A paper-faithful implementation of the Model Discovery Agent"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -21,14 +21,19 @@ physics = [
     "ScienceAgent @ git+https://github.com/SampsonML/DiscoverPhysics.git@33b7fa9df96de9c35744efd181ca7e5a8dd60ad5#subdirectory=ScienceAgent",
 ]
 design = ["cma>=4.0"]
+bic = ["scipy>=1.11"]
 recovery = ["scipy>=1.11", "sympy>=1.12"]
 neuron = [
     "neuronbench @ git+https://github.com/murphyk/neuronbench.git@c354622458c460b419cab821d482c879f0578377",
 ]
+glucose = [
+    "glucosebench @ git+https://github.com/murphyk/glucosebench.git@6bb0ff6f44513e1e816ac3f0827531a366e8d7a0",
+    "scipy>=1.11",
+]
 baselines = ["neurobench>=2.3.0"]
 dev = [
     "pytest>=8.0",
-    "model-discovery-agent[design,llm,neuron,numpyro,recovery]",
+    "model-discovery-agent[bic,design,glucose,llm,neuron,numpyro,recovery]",
 ]
 
 [project.scripts]

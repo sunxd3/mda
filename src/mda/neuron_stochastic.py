@@ -1,10 +1,16 @@
-"""Fox--Lu stochastic NeuronBench candidate and environment (benchmark v4).
+"""Fox--Lu stochastic NeuronBench candidate and environment.
 
 The one-step equations below intentionally mirror NeuronBench commit
 ``c354622``.  Unlike ``neuronbench.stochastic.run_particles``, they expose and
 carry voltage and every gate so that a bootstrap filter can resample the latent
 cell between observations.  The only numerical extension is the candidate's
 sampled slow-Na depolarized tau; recovery remains the benchmark's 1500 ms.
+
+The environment follows the v5 paper ("HHbench") where the pinned package
+allows it: the brief/weak-step D0 and the fixed-scale feature metric. v5's
+90-protocol menu, 20 stratified voltage samples per experiment, and shared
+24-query set are not released, so the pinned package's protocol pool, ~4 ms
+observation grid, and per-world held-out protocols are used instead.
 """
 
 from __future__ import annotations
@@ -17,10 +23,15 @@ from .neuronbench_adapter import (
     NeuronHypothesis,
     _neuronbench,
     evaluate_neuron_recovery,
+    fixed_scale_feature_mse,
     neuron_candidate,
     reference_neuron_candidate,
 )
 from .types import CandidateModel, Datum, StateSpaceModel
+
+
+# Distinct (theta, protocol) rollouts whose summaries each candidate keeps.
+_ROLLOUT_CACHE_SIZE = 64
 
 
 def _protocol(protocol):
@@ -32,7 +43,9 @@ def stochastic_trace_features(trace, protocol):
     """Summarize the observed ~4 ms grid, not the deterministic ~0.1 ms grid.
 
     Coarse observations cannot recover spikes missed between samples. Forecasts
-    and held-out targets instead average features of full simulated traces.
+    and held-out targets instead average features of full simulated traces;
+    residual checks compare against ``metadata["observed_target_prediction"]``,
+    the same features averaged over rollouts sampled on this grid.
     """
     _, indices, start = _protocol(protocol)
     return _neuronbench().evaluator.eval_features(
@@ -136,9 +149,10 @@ def stochastic_neuron_candidate(
     if channel_count <= 0 or prediction_rollouts <= 0:
         raise ValueError("channel_count and prediction_rollouts must be positive")
     base = reference_neuron_candidate() if spec is None else neuron_candidate(spec)
+    summaries = {}
 
     def rollout(theta, action, count):
-        I, obs_idx, _ = _protocol(action)
+        I, obs_idx, test_start = _protocol(action)
         key = zlib.crc32(str(action[0]).encode())
         rng = np.random.default_rng(np.random.SeedSequence([seed, key]))
         state = _initial(theta, spec, count)
@@ -146,19 +160,41 @@ def stochastic_neuron_candidate(
         for index, applied in enumerate(I):
             state = _step(state, theta, spec, applied, rng, channel_count, 0.025)
             traces[:, index] = state[:, 0]
-        return traces, obs_idx
+        return traces, obs_idx, test_start
+
+    def summary(theta, action):
+        """One CRN rollout's (mean observed trace, fine-grid and observed-grid features).
+
+        Rollouts are seeded by protocol label, so all three predictors share
+        one; only these small summaries are cached, not the full traces.
+        """
+        theta = np.asarray(theta, dtype=float)
+        key = (theta.tobytes(), action[0], repr(action[1]), prediction_rollouts)
+        if key in summaries:
+            summaries[key] = summaries.pop(key)
+            return summaries[key]
+        features = _neuronbench().evaluator.eval_features
+        traces, obs_idx, test_start = rollout(theta, action, prediction_rollouts)
+        observed = traces[:, obs_idx]
+        observed_start = int(np.searchsorted(obs_idx, test_start))
+        if len(summaries) >= _ROLLOUT_CACHE_SIZE:
+            summaries.pop(next(iter(summaries)))
+        summaries[key] = (
+            observed.mean(axis=0),
+            np.mean([features(trace, test_start) for trace in traces], axis=0),
+            np.mean([features(trace, observed_start) for trace in observed], axis=0),
+        )
+        return summaries[key]
 
     def predict(theta, action):
-        traces, obs_idx = rollout(theta, action, prediction_rollouts)
-        return traces[:, obs_idx].mean(axis=0)
+        return summary(theta, action)[0].copy()
 
     def predict_target(theta, action):
-        nb = _neuronbench()
-        traces, _ = rollout(theta, action, prediction_rollouts)
-        _, _, test_start = _protocol(action)
-        return np.mean(
-            [nb.evaluator.eval_features(trace, test_start) for trace in traces], axis=0
-        )
+        return summary(theta, action)[1].copy()
+
+    def observed_target_prediction(theta, action):
+        # Same features as ``stochastic_trace_features`` of an observation.
+        return summary(theta, action)[2].copy()
 
     def initial(theta, action, particles, rng):
         del action, rng
@@ -188,6 +224,7 @@ def stochastic_neuron_candidate(
             "channel_count": channel_count,
             "prediction_rollouts": prediction_rollouts,
             "observation_std_mv": 2.0,
+            "observed_target_prediction": observed_target_prediction,
         },
     )
 
@@ -206,20 +243,17 @@ class StochasticNeuronBenchEnvironment:
             "A noisy single-compartment Hodgkin-Huxley neuron may contain a novel "
             "membrane mechanism. " + self.world.text_prior
         )
-        # Appendix H.4 fixes D0 by protocol identity, not by the incidental
-        # ordering of the upstream design menu.
+        # v5 fixes D0 by protocol identity (a brief 12 uA/40 ms and a weak
+        # 5 uA/120 ms step), not by the ordering of the upstream design menu.
         wanted = {
             "brief step (12 uA, 40 ms)",
-            "long step (10 uA, 300 ms)",
+            "weak step (5 uA, 120 ms)",
         }
         by_label = {protocol[0]: protocol for protocol in self.world.protocol_pool}
         missing = wanted.difference(by_label)
         if missing:
             raise RuntimeError(f"NeuronBench is missing the paper D0 protocols: {sorted(missing)}")
-        self.initial_protocols = [
-            by_label["brief step (12 uA, 40 ms)"],
-            by_label["long step (10 uA, 300 ms)"],
-        ]
+        self.initial_protocols = [by_label[label] for label in sorted(wanted)]
         self.initial_data = [
             Datum(p, self.world.run(p).voltage) for p in self.initial_protocols
         ]
@@ -244,6 +278,12 @@ class StochasticNeuronBenchEnvironment:
         return evaluate_neuron_recovery(self.world_name, model, parameters)
 
     def evaluate_predictor(self, predictor) -> float:
+        """v5 Eq. hhFixedScaleMSE: mean squared feature error over fixed scales.
+
+        Scales are s = (3, 3, 3, 3, 12, 8) for the six features; references are
+        expected features from 200 independent oracle rollouts (v5 gives no
+        count; 200 is the pinned evaluator's default).
+        """
         nb = _neuronbench()
         targets = nb.evaluator.held_out_feature_targets(
             self.world_name,
@@ -252,14 +292,4 @@ class StochasticNeuronBenchEnvironment:
             seed=self.seed,
             reps=200,
         )
-        truth = np.stack([targets[p[0]][0] for p in self.query_actions])
-        forecast = np.stack(
-            [np.asarray(predictor(p), float) for p in self.query_actions]
-        )
-        if forecast.shape != truth.shape:
-            raise ValueError("predictor features must match held-out feature shape")
-        query_variance = np.var(truth, axis=0)
-        if np.any(query_variance == 0):
-            raise ValueError("Eq. 1 is undefined for zero query variance")
-        component_mse = np.mean((forecast - truth) ** 2, axis=0)
-        return float(np.mean(component_mse / query_variance))
+        return fixed_scale_feature_mse(targets, self.query_actions, predictor)

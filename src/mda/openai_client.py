@@ -15,7 +15,11 @@ class OpenAIJSONClient:
 
     When ``cache_dir`` is set, response text is persisted under request hashes
     in that directory. Callers are responsible for the privacy and
-    lifecycle of that data.
+    lifecycle of that data. GPT-5-family and o-series reasoning models default
+    to medium reasoning effort, the setting of the v5 paper's main-text runs.
+    Only completed responses which parse as JSON (for JSON formats) are cached.
+    ``replay_only`` serves the cache and fails on a miss without loading the
+    SDK or credentials.
     """
 
     def __init__(
@@ -24,17 +28,31 @@ class OpenAIJSONClient:
         api_key: str | None = None,
         *,
         cache_dir: Path | str | None = None,
+        reasoning_effort: str = "medium",
+        replay_only: bool = False,
     ) -> None:
-        try:
-            from openai import OpenAI
-        except ImportError as error:
-            raise RuntimeError("install model-discovery-agent[llm] to use OpenAI") from error
-        key = api_key or os.environ.get("OPENAI_API_KEY")
-        if not key:
-            raise RuntimeError("OPENAI_API_KEY is not set")
+        if replay_only and cache_dir is None:
+            raise ValueError("replay_only requires cache_dir")
         self.model = model
         self.cache_dir = Path(cache_dir) if cache_dir is not None else None
-        self._client = OpenAI(api_key=key)
+        self.reasoning_effort = reasoning_effort
+        self.replay_only = replay_only
+        self.api_key = api_key
+        self._client = None
+        if not replay_only:
+            self._sdk_client()
+
+    def _sdk_client(self):
+        if self._client is None:
+            try:
+                from openai import OpenAI
+            except ImportError as error:
+                raise RuntimeError("install model-discovery-agent[llm] to use OpenAI") from error
+            key = self.api_key or os.environ.get("OPENAI_API_KEY")
+            if not key:
+                raise RuntimeError("OPENAI_API_KEY is not set")
+            self._client = OpenAI(api_key=key)
+        return self._client
 
     def _cache_path(self, request: dict[str, Any]) -> Path | None:
         if self.cache_dir is None:
@@ -90,17 +108,17 @@ class OpenAIJSONClient:
         response_format: dict[str, Any] | None = None,
     ) -> str:
         output_format = response_format or {"type": "json_object"}
-        is_5_6 = self.model.startswith("gpt-5.6-")
+        is_reasoning = self.model.startswith(("gpt-5", "o1", "o3", "o4"))
         request = dict(
             model=self.model,
             instructions=system,
             input=prompt,
-            max_output_tokens=max(max_tokens, 4096) if is_5_6 else max_tokens,
+            max_output_tokens=max(max_tokens, 4096) if is_reasoning else max_tokens,
             text={"format": output_format},
         )
-        # The GPT-5.6 reasoning variants expose no sampling-temperature knob.
-        if is_5_6:
-            request["reasoning"] = {"effort": "low"}
+        # GPT-5-family and o-series reasoning models expose no sampling-temperature knob.
+        if is_reasoning:
+            request["reasoning"] = {"effort": self.reasoning_effort}
         else:
             request["temperature"] = temperature
         cache_path = self._cache_path(request)
@@ -108,11 +126,16 @@ class OpenAIJSONClient:
             cached = self._read_cache(cache_path)
             if cached is not None:
                 return cached
-        response = self._client.responses.create(**request)
+        if self.replay_only:
+            raise RuntimeError("OpenAI replay cache miss")
+        response = self._sdk_client().responses.create(**request)
         if response.status != "completed":
             reason = getattr(response.incomplete_details, "reason", "unknown")
             raise RuntimeError(f"OpenAI response did not complete: {reason}")
         text = response.output_text
+        if output_format.get("type") in ("json_object", "json_schema"):
+            # Raise before caching so a malformed reply cannot poison replay.
+            json.loads(text)
         if cache_path is not None and isinstance(text, str) and text.strip():
             self._write_cache(cache_path, text)
         return text

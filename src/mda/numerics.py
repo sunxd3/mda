@@ -38,7 +38,7 @@ def systematic_resample(weights: np.ndarray, rng: np.random.Generator) -> np.nda
     positions = (rng.random() + np.arange(len(weights))) / len(weights)
     cumulative = np.cumsum(weights)
     cumulative[-1] = 1.0
-    return np.searchsorted(cumulative, positions, side="right")
+    return np.minimum(np.searchsorted(cumulative, positions, side="right"), len(weights) - 1)
 
 
 def weighted_mean(values: np.ndarray, weights: np.ndarray) -> np.ndarray:
