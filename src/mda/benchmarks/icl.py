@@ -113,9 +113,10 @@ def make_icl_predictor(
             "items": value_schema,
         }},
     }
+    # A JSON number costs about 5-8 tokens; 32 per value leaves a 4x margin.
     payload = client.ask_json(
         system, prompt, schema=schema, name="icl_forecast", temperature=0.3,
-        max_tokens=max(800, 80 * max(1, len(queries)) * max(1, int(np.prod(shape)))),
+        max_tokens=max(800, 32 * max(1, len(queries)) * max(1, int(np.prod(shape)))),
     )
     predictions = payload.get("predictions") if isinstance(payload, dict) else None
     if not isinstance(predictions, list) or len(predictions) != len(queries):

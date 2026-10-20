@@ -15,9 +15,11 @@ class OpenAIJSONClient:
 
     When ``cache_dir`` is set, response text is persisted under request hashes
     in that directory. Callers are responsible for the privacy and
-    lifecycle of that data. GPT-5.6 models default to medium reasoning effort,
-    the setting of the v5 paper's main-text runs. ``replay_only`` serves the
-    cache and fails on a miss without loading the SDK or credentials.
+    lifecycle of that data. GPT-5-family and o-series reasoning models default
+    to medium reasoning effort, the setting of the v5 paper's main-text runs.
+    Only completed responses which parse as JSON (for JSON formats) are cached.
+    ``replay_only`` serves the cache and fails on a miss without loading the
+    SDK or credentials.
     """
 
     def __init__(
@@ -106,16 +108,16 @@ class OpenAIJSONClient:
         response_format: dict[str, Any] | None = None,
     ) -> str:
         output_format = response_format or {"type": "json_object"}
-        is_5_6 = self.model.startswith("gpt-5.6-")
+        is_reasoning = self.model.startswith(("gpt-5", "o1", "o3", "o4"))
         request = dict(
             model=self.model,
             instructions=system,
             input=prompt,
-            max_output_tokens=max(max_tokens, 4096) if is_5_6 else max_tokens,
+            max_output_tokens=max(max_tokens, 4096) if is_reasoning else max_tokens,
             text={"format": output_format},
         )
-        # The GPT-5.6 reasoning variants expose no sampling-temperature knob.
-        if is_5_6:
+        # GPT-5-family and o-series reasoning models expose no sampling-temperature knob.
+        if is_reasoning:
             request["reasoning"] = {"effort": self.reasoning_effort}
         else:
             request["temperature"] = temperature
@@ -131,6 +133,9 @@ class OpenAIJSONClient:
             reason = getattr(response.incomplete_details, "reason", "unknown")
             raise RuntimeError(f"OpenAI response did not complete: {reason}")
         text = response.output_text
+        if output_format.get("type") in ("json_object", "json_schema"):
+            # Raise before caching so a malformed reply cannot poison replay.
+            json.loads(text)
         if cache_path is not None and isinstance(text, str) and text.strip():
             self._write_cache(cache_path, text)
         return text

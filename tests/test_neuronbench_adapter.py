@@ -6,12 +6,14 @@ import numpy as np
 import pytest
 
 from mda.neuronbench_adapter import (
+    FEATURE_SCALES,
     NeuronBenchEnvironment,
     NeuronBenchProposer,
     NeuronHypothesis,
     neuron_candidate,
     reference_neuron_candidate,
 )
+from mda.types import Datum
 
 
 pytest.importorskip("neuronbench")
@@ -184,57 +186,62 @@ def test_observation_std_converts_table14_floor_to_raw_mv():
     np.testing.assert_allclose(actual, [3.0, 3.0, 3.0, 3.0, 8.4])
 
 
-def test_evaluate_predictor_uses_component_query_variances_without_training_mutation(
-    monkeypatch,
-):
-    actions = ["q1", "q2", "q3"]
+def test_evaluate_predictor_uses_v5_fixed_scales_without_training_mutation(monkeypatch):
+    import neuronbench as nb
+
+    actions = [("q1", []), ("q2", [])]
+    # n_pre (index 1) is constant across queries, which v4's Eq. 1 cannot score.
     truth = {
-        "q1": np.asarray([1.0, 10.0]),
-        "q2": np.asarray([3.0, 14.0]),
-        "q3": np.asarray([5.0, 10.0]),
+        "q1": (np.asarray([1.0, 0.0, -1.0, 0.0, -70.0, -60.0]), 100, 10),
+        "q2": (np.asarray([4.0, 0.0, -4.0, 1.0, -75.0, -65.0]), 100, 10),
     }
-    forecasts = {
-        "q1": np.asarray([2.0, 8.0]),
-        "q2": np.asarray([3.0, 16.0]),
-        "q3": np.asarray([8.0, 10.0]),
-    }
+    errors = np.asarray([3.0, 0.0, -3.0, 0.0, 12.0, -8.0])
+    calls = []
 
-    class World:
-        def __init__(self):
-            self.calls = []
+    def targets(world, **kwargs):
+        calls.append((world, kwargs))
+        return truth
 
-        def run(self, action):
-            self.calls.append(action)
-            return SimpleNamespace(voltage=truth[action])
+    def run(action):
+        raise AssertionError("evaluation must not run the training world")
 
     environment = object.__new__(NeuronBenchEnvironment)
-    environment.world = World()
+    environment.world_name = "h_sag"
+    environment.world = SimpleNamespace(run=run)
     environment.query_actions = actions
     environment.initial_data = ["training sentinel"]
-    monkeypatch.setattr(
-        "mda.neuronbench_adapter.trace_features", lambda trace, protocol: np.asarray(trace)
-    )
-    before = list(environment.initial_data)
-    score = environment.evaluate_predictor(lambda action: forecasts[action])
+    monkeypatch.setattr(nb.evaluator, "held_out_feature_targets", targets)
+    score = environment.evaluate_predictor(lambda action: truth[action[0]][0] + errors)
 
-    # Component MSEs 10/3 and 8/3, query variances 8/3 and 32/9:
-    # mean(5/4, 3/4) = 1, unlike a ratio of pooled sums or fixed-scale MSE.
-    assert score == pytest.approx(1.0)
-    assert environment.world.calls == actions
-    assert environment.initial_data == before
+    # Each nonzero error is one scale: four unit terms over 2 x 6 entries.
+    assert score == pytest.approx(4 / 6)
+    assert calls == [("h_sag", {"stochastic": False})]
+    assert environment.initial_data == ["training sentinel"]
+    np.testing.assert_array_equal(FEATURE_SCALES, nb.evaluator._EVAL_FEAT_SCALES)
 
 
-def test_evaluate_predictor_rejects_zero_query_variance(monkeypatch):
-    environment = object.__new__(NeuronBenchEnvironment)
-    environment.query_actions = ["a", "b"]
-    environment.world = SimpleNamespace(
-        run=lambda action: SimpleNamespace(voltage=np.asarray([1.0, 2.0 if action == "a" else 4.0]))
-    )
-    monkeypatch.setattr(
-        "mda.neuronbench_adapter.trace_features", lambda trace, protocol: np.asarray(trace)
-    )
-    with pytest.raises(ValueError, match="zero query variance"):
-        environment.evaluate_predictor(lambda action: np.asarray([1.0, 3.0]))
+@pytest.mark.parametrize(
+    "world", ["z_rebound", "h_sag", "na_fatigue", "ca_rebound", "d_type", "textbook_M"]
+)
+def test_evaluate_predictor_is_finite_and_matches_upstream_on_every_world(world, monkeypatch):
+    import neuronbench as nb
+
+    # Simulate each world's true queries once for both scorers below.
+    original, cache = nb.evaluator.held_out_feature_targets, {}
+
+    def targets(name, stochastic=False, **kwargs):
+        assert not stochastic
+        if name not in cache:
+            cache[name] = original(name, stochastic=False)
+        return cache[name]
+
+    monkeypatch.setattr(nb.evaluator, "held_out_feature_targets", targets)
+    environment = NeuronBenchEnvironment(world, seed=0)
+    score = environment.evaluate_predictor(lambda action: np.zeros(6))
+
+    # Zero features are those of upstream's flat 0 mV fallback trace.
+    assert np.isfinite(score) and score > 0
+    assert score == pytest.approx(nb.evaluator.feature_forecast_mse({}, world, stochastic=False))
 
 
 def test_evaluate_predictor_real_queries_smoke():
@@ -244,7 +251,8 @@ def test_evaluate_predictor_real_queries_smoke():
     score = environment.evaluate_predictor(
         lambda action: trace_features(environment.world.run(action).voltage, action)
     )
-    assert score == pytest.approx(0.0)
+    # References use the full-resolution true trace, observations every tenth sample.
+    assert score == pytest.approx(0.0, abs=1e-6)
 
 
 def test_neuron_proposer_receives_structures_priors_and_residuals():
@@ -309,3 +317,77 @@ def test_neuron_proposer_receives_structures_priors_and_residuals():
     assert "recovery time constant is fixed at 1500 ms" in client.prompt
     assert "Ih/M" not in client.prompt
     assert "Ca/D" not in client.prompt
+
+
+class _PayloadClient:
+    def __init__(self, *hypotheses):
+        self.payload = {"hypotheses": list(hypotheses)}
+
+    def ask_json(self, system, prompt, **kwargs):
+        return json.loads(json.dumps(self.payload))
+
+
+def _propose(client, current_models=(), count=4):
+    return NeuronBenchProposer(client, feature_fn=lambda trace, action: np.zeros(6)).propose(
+        context="Unknown neuron", dataset=[Datum(("brief", []), np.zeros(3))],
+        current_models=list(current_models), residuals=(), count=count,
+    )
+
+
+_CHANNEL_ITEM = dict(
+    name="M", mechanism_type="channel", reversal_mv=-77.0, opens_on="depol",
+    inactivates=False, activation_slope_mv=10.0, activation_power=1,
+    inactivation_half_mv=0.0, inactivation_slope_mv=5.0, inactivation_tau_ms=100.0,
+    tau_gate="activation", activation_tau_ms=1.0, g_bounds=[0.5, 5.0],
+    half_mv_bounds=[-50.0, -20.0], tau_ms_bounds=[10.0, 200.0],
+)
+
+
+def test_numeric_spelling_does_not_split_structure_keys():
+    as_ints = {
+        **_CHANNEL_ITEM, "name": "M again", "reversal_mv": -77, "activation_slope_mv": 10,
+        "activation_power": 1.0, "inactivation_half_mv": -0.0, "activation_tau_ms": 1,
+        "g_bounds": [0.5, 5], "half_mv_bounds": [-50, -20], "tau_ms_bounds": [10, 200],
+    }
+    floats, ints = NeuronHypothesis(**_CHANNEL_ITEM), NeuronHypothesis(**as_ints)
+    numpy = replace(floats, reversal_mv=np.float64(-77.0), g_bounds=(np.float64(0.5), np.int64(5)))
+    keys = {neuron_candidate(spec).key for spec in (floats, ints, numpy)}
+    assert len(keys) == 1
+    assert ints.activation_power == 1 and type(ints.activation_power) is int
+    assert repr(ints.inactivation_half_mv) == "0.0"
+
+    first = _propose(_PayloadClient(_CHANNEL_ITEM))
+    assert len(first) == 1
+    # Re-proposed with JSON ints: a duplicate of the archive and within its batch.
+    assert _propose(_PayloadClient(as_ints), current_models=first) == []
+    assert len(_propose(_PayloadClient(_CHANNEL_ITEM, as_ints))) == 1
+
+
+def test_slow_na_ignores_unused_channel_fields_and_bad_items_do_not_abort_batch():
+    slow_na = {
+        **_CHANNEL_ITEM, "name": "slow Na", "mechanism_type": "slow_na",
+        "g_bounds": [0, 0], "half_mv_bounds": [0, 0], "activation_slope_mv": 0,
+        "activation_power": 0, "tau_gate": "inactivation", "tau_ms_bounds": [-1, -2],
+    }
+    missing = {key: value for key, value in _CHANNEL_ITEM.items() if key != "g_bounds"}
+    models = _propose(_PayloadClient(missing, slow_na, _CHANNEL_ITEM))
+    assert [model.name for model in models] == ["slow Na", "M"]
+    assert models[0].prior.names == ("gL", "tau_s_ms")
+    # The unused fields still cannot pass for a channel.
+    with pytest.raises(ValueError):
+        NeuronHypothesis(**{**slow_na, "mechanism_type": "channel"})
+
+
+@pytest.mark.parametrize(
+    "bounds",
+    [
+        {"g_bounds": (-5.0, 5.0)},
+        {"tau_ms_bounds": (-100.0, 50.0)},
+        {"tau_ms_bounds": (0.0, 50.0)},
+    ],
+)
+def test_sampled_conductance_and_tau_bounds_must_be_physical(bounds):
+    NeuronHypothesis(**{**_CHANNEL_ITEM, "g_bounds": (0.0, 5.0)})  # g may reach zero.
+    with pytest.raises(ValueError, match="nonnegative"):
+        NeuronHypothesis(**{**_CHANNEL_ITEM, **bounds})
+    assert _propose(_PayloadClient({**_CHANNEL_ITEM, **{k: list(v) for k, v in bounds.items()}})) == []

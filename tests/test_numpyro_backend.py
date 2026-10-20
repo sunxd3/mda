@@ -73,3 +73,22 @@ def test_dependent_support_uses_substituted_parent_and_simplex_is_rejected():
 
     with pytest.raises(ValueError, match="changes dimension"):
         compile_numpyro_model(simplex, np.ones((2, 1)))
+
+
+def test_non_finite_mu_is_a_non_finite_prediction_and_mu_must_be_one_row_per_feature_row():
+    from mda.types import NonFinitePrediction
+
+    def ratio(ctx):
+        scale = numpyro.sample("scale", dist.Normal())
+        numpyro.deterministic("mu", scale / ctx["features"][:, 0])
+
+    candidate = compile_numpyro_model(ratio, np.ones((2, 1)))
+    with pytest.raises(NonFinitePrediction):
+        candidate.observation_prediction(np.asarray([1.0]), np.zeros((2, 1)))
+
+    def matrix(ctx):
+        scale = numpyro.sample("scale", dist.Normal())
+        numpyro.deterministic("mu", scale * ctx["features"])
+
+    with pytest.raises(ValueError, match="shape"):
+        compile_numpyro_model(matrix, np.ones((2, 2)))

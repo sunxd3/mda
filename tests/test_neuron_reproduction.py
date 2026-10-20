@@ -78,7 +78,7 @@ def test_stochastic_evaluation_uses_v5_fixed_feature_scales(monkeypatch):
     )
     scales = np.array([3.0, 3.0, 3.0, 3.0, 12.0, 8.0])
     assert score == pytest.approx(np.mean((np.arange(1, 7) / scales) ** 2))
-    from mda.neuron_stochastic import FEATURE_SCALES
+    from mda.neuronbench_adapter import FEATURE_SCALES
     assert np.array_equal(FEATURE_SCALES, nb.evaluator._EVAL_FEAT_SCALES)
 
 

@@ -14,7 +14,7 @@ from typing import Any
 import numpy as np
 
 from mda.agent import AgentConfig, ModelDiscoveryAgent
-from mda.expressions import compile_expression
+from mda.expressions import canonical_expression, compile_expression, screen_candidate
 from mda.likelihoods import DeterministicGaussianLikelihood
 from mda.smc import SMCConfig
 from mda.types import CandidateModel, Datum, UniformPrior
@@ -103,7 +103,8 @@ def force_candidate(name: str, expression: str, parameter_names: Sequence[str],
             result.append(position.copy())
         return np.asarray(result)
 
-    return CandidateModel(name=name, structure=expression, prior=prior, predict=predict)
+    return CandidateModel(name=name, structure=canonical_expression(expression), prior=prior,
+                          predict=predict)
 
 
 class ForceProposer:
@@ -124,7 +125,7 @@ Infer a central force magnitude fmag(r, qi, qj, t; theta). Positive magnitude is
 attraction and acceleration is -fmag*rhat/m. qi is the probe charge and qj the
 source coupling. Propose {count} parsimonious forms.
 Approved functions are abs, cos, exp, gamma, k0, k1, log, log10, maximum,
-minimum, sign, sin, sqrt, tan, tanh, where. Unknown constants need finite
+minimum, sign, sin, sqrt, tan, tanh. Unknown constants need finite
 uniform priors. Existing structures and priors: {json.dumps(structures)}
 Residual reports: {json.dumps(list(residuals))}
 Trajectory observations: {json.dumps(observations)}"""
@@ -147,12 +148,10 @@ Trajectory observations: {json.dumps(observations)}"""
                 model = force_candidate(spec["name"].strip(), spec["expr"].strip(),
                     [p["name"] for p in params], [p["low"] for p in params],
                     [p["high"] for p in params], coulomb_roles=self.coulomb_roles)
-                if model.key not in existing:
-                    # Compile and execute against real action structure before admitting it.
-                    if dataset:
-                        model.observation_prediction(model.prior.sample(np.random.default_rng(0), 1)[0], dataset[0].action)
+                # Compile and execute against real action structure before admitting it.
+                if model.key not in existing and screen_candidate(model, dataset, actions=1):
                     models.append(model); existing.add(model.key)
-            except (KeyError, TypeError, ValueError, RuntimeError, FloatingPointError):
+            except (KeyError, TypeError, ValueError, RuntimeError, ArithmeticError):
                 continue
         return models[:count]
 

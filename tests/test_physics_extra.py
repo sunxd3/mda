@@ -64,3 +64,27 @@ def test_extra_proposer_receives_observations_and_complete_priors():
 
     ForceProposer(Client(), "circle").propose(context="test", dataset=[Datum(action, np.full((5,11,2),123.25))],
         current_models=[model], residuals=[], count=1)
+
+
+def test_force_proposer_drops_invalid_laws_keeps_valid_ones_and_names_the_reserved_coefficient():
+    prompts = []
+    hypotheses = [
+        {"name": "divides", "expr": "a*qi*qj/r + 1/0", "params": [{"name": "a", "low": 0.1, "high": 2.0}]},
+        {"name": "overflows", "expr": "a*qi*qj/r*10.0**400", "params": [{"name": "a", "low": 0.1, "high": 2.0}]},
+        {"name": "fine", "expr": " a * qi*qj / r ", "params": [{"name": "a", "low": 0.1, "high": 2.0}]},
+        {"name": "same", "expr": "a*qi*qj/r", "params": [{"name": "a", "low": 0.1, "high": 2.0}]},
+    ]
+
+    class Client:
+        def ask_json(self, system, prompt, **kwargs):
+            prompts.append(prompt)
+            return {"hypotheses": hypotheses}
+
+    action = _circle_action(3, 0)
+    data = [Datum(action, np.zeros((5, 11, 2)))]
+    models = ForceProposer(Client(), "circle").propose(
+        context="", dataset=data, current_models=[], residuals=[], count=4)
+    assert [m.name for m in models] == ["fine"]
+    assert models[0].structure == "a * qi * qj / r"
+    ForceProposer(Client(), "ether").propose(context="", dataset=data, current_models=[], residuals=[], count=1)
+    assert "alpha" in prompts[-1] and "reserved" in prompts[-1]

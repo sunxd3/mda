@@ -80,10 +80,12 @@ def model_eig(
     for weight, fit in zip(belief.model_weights, belief.fits, strict=True):
         if weight == 0.0:
             continue
-        predictions = np.stack(
-            [_flat(fit.model.observation_prediction(theta, action)) for theta in fit.parameters.particles]
-        )
-        model_means.append(weighted_mean(predictions, fit.parameters.weights))
+        keep = fit.parameters.weights > 0
+        predictions = np.stack([
+            _flat(fit.model.observation_prediction(theta, action))
+            for theta in fit.parameters.particles[keep]
+        ])
+        model_means.append(weighted_mean(predictions, fit.parameters.weights[keep]))
         model_weights.append(weight)
     means = np.stack(model_means)
     return _weighted_disagreement(means, np.asarray(model_weights), observation_covariance)
@@ -207,8 +209,9 @@ def value_of_information(
         raise ValueError(f"unknown design flavour {flavour!r}")
     try:
         return scorers[flavour](action)
-    except (NonFinitePrediction, ArithmeticError):
-        # A weighted model that cannot predict this action makes it unusable.
+    except (ValueError, ArithmeticError):
+        # A weighted model that cannot predict this action makes it unusable;
+        # the same errors give that model -inf likelihood when fitting.
         return -np.inf
 
 

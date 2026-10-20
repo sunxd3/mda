@@ -141,3 +141,32 @@ def test_independent_trace_noise_never_uses_dense_linear_algebra(monkeypatch):
     belief = BeliefState((left, right), np.asarray([0.25, 0.75]))
     assert model_eig(None, belief, 2.0) == pytest.approx(3750.0)
     assert joint_eig(None, belief, np.full(10_000, 2.0)) == pytest.approx(3750.0)
+
+
+def test_zero_weight_particles_are_not_asked_to_predict():
+    def predict(theta, action):
+        if theta[0] > 5:
+            return np.asarray(np.nan)
+        return np.asarray(theta[0] * action)
+
+    posterior = replace(
+        fit("line", [[1.0], [9.0]], predict).parameters, weights=np.asarray([1.0, 0.0]),
+    )
+    belief = BeliefState((ModelFit(fit("line", [[1.0], [9.0]], predict).model, posterior, 0.0),),
+                         np.asarray([1.0]), 0.0, 0.0)
+    assert np.isfinite(model_eig(2.0, belief, 1.0))
+    assert np.isfinite(joint_eig(2.0, belief, 1.0))
+
+
+def test_design_tolerates_the_domain_errors_fitting_tolerates():
+    def singular(theta, action):
+        if action == 0.0:
+            raise ValueError("force is singular at zero separation")
+        return np.asarray(theta[0] / action)
+
+    belief = BeliefState(
+        (fit("singular", [[1.0], [2.0]], singular), fit("line", [[1.0], [2.0]], lambda t, a: np.asarray(t[0] * a))),
+        np.asarray([0.5, 0.5]), 0.0, 0.0,
+    )
+    action, scores = choose_design([0.0, 1.0], belief, flavour="model", observation_covariance=1.0)
+    assert action == 1.0 and scores[0] == -np.inf

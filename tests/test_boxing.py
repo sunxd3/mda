@@ -129,3 +129,29 @@ def test_smoke_agent_and_unsafe_boundary():
     assert agent.config.model_cap == 16
     with pytest.raises(PermissionError):
         make_agent(BoxingEnvironment("irt", candidate_count=4, query_count=2), object())
+
+
+def test_numpyro_proposer_drops_a_malformed_program_but_keeps_its_sibling():
+    pytest.importorskip("numpyro")
+    env = BoxingEnvironment("irt", candidate_count=4, query_count=2)
+
+    class Client:
+        def ask_json(self, system, prompt, **kwargs):
+            return {"models": [
+                {"name": "broken", "source": "def model(ctx):\n    numpyro.deterministic('mu', (\n"},
+                {"name": "fine", "source": """
+def model(ctx):
+    latent = numpyro.sample('latent', dist.Normal(jnp.zeros(len(ctx['features'])), 1))
+    numpyro.deterministic('mu', latent)
+"""},
+            ]}
+
+    models = _NumPyroProposer(Client(), env, True).propose(
+        context="task", dataset=env.initial_data, current_models=[], residuals=[], count=2)
+    assert [m.name for m in models] == ["fine"]
+
+
+def test_location_needs_room_for_its_three_seed_experiments():
+    with pytest.raises(ValueError, match="candidate_count >= 3"):
+        BoxingEnvironment("location", candidate_count=2, query_count=1)
+    BoxingEnvironment("location", candidate_count=3, query_count=1)

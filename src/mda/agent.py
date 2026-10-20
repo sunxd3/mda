@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -15,6 +15,23 @@ from .posterior import BeliefState, fit_model_posterior
 from .proposer import ModelProposer
 from .smc import Likelihood, SMCConfig
 from .types import CandidateModel, Datum
+
+
+def default_action_key(action: Any) -> str:
+    """Exact text key for an experiment.
+
+    ``repr`` of an array keeps eight significant digits, elides long arrays
+    and follows the global print options, so distinct designs could collide
+    in ``used_action_keys`` and in the optimizer's evaluation table.
+    """
+    if isinstance(action, np.ndarray):
+        return f"ndarray{action.shape}{action.dtype}:{action.tobytes().hex()}"
+    if isinstance(action, Mapping):
+        items = sorted(action.items(), key=lambda item: repr(item[0]))
+        return "{" + ", ".join(f"{key!r}: {default_action_key(value)}" for key, value in items) + "}"
+    if isinstance(action, (list, tuple)):
+        return f"{type(action).__name__}({', '.join(default_action_key(value) for value in action)})"
+    return repr(action)
 
 
 @dataclass(frozen=True)
@@ -82,7 +99,7 @@ class ModelDiscoveryAgent:
         task_noise_covariance: float | np.ndarray | None = None,
         optimizer: Callable[[Callable[[Any], float], np.random.Generator], Any] | None = None,
         experiment_budget: int | None = None,
-        action_key: Callable[[Any], str] = repr,
+        action_key: Callable[[Any], str] = default_action_key,
         evidence: EvidenceBackend | None = None,
         check: Callable[[BeliefState, Datum, Sequence[Datum]], float] | None = None,
         seed: int = 0,
@@ -110,7 +127,9 @@ class ModelDiscoveryAgent:
         self.seed = seed
         self.rng = np.random.default_rng(seed)
         self.expansion_count = 0
-        self.used_action_keys = {action_key(datum.action) for datum in initial_data}
+        self.used_action_keys = {action_key(datum.action) for datum in self.dataset}
+        if config.design_flavour in {"task", "task_full_observation"} and not self.query_actions:
+            raise ValueError("task value of information needs query_actions")
         self.last_design_scores: np.ndarray | None = None
         self.last_predictive_error: float | None = None
 
@@ -210,6 +229,8 @@ class ModelDiscoveryAgent:
     def design(self) -> Any:
         if self.experiment_budget is not None and self.experiments_run >= self.experiment_budget:
             raise ValueError("the experiment budget is exhausted")
+        if self.config.design_flavour in {"task", "task_full_observation"} and not self.query_actions:
+            raise ValueError("task value of information needs query_actions")
         options = dict(
             flavour=self.config.design_flavour,
             observation_covariance=(
@@ -263,28 +284,45 @@ class ModelDiscoveryAgent:
         gate_error = error if self.config.expansion_gate == "prequential" else in_sample_check(
             self.belief, self.dataset, target=self.target, floor=self.config.predictive_floor,
         )
+        key = self.action_key(action)
+        key_was_used = key in self.used_action_keys
+        previous_cap = self.active_model_cap
         self.dataset.append(fresh)
-        self.used_action_keys.add(self.action_key(action))
+        self.used_action_keys.add(key)
         self.experiments_run += 1
         if gate_error > self.config.error_threshold:
             self.active_model_cap = self.config.model_cap
-        self.belief = self._fit(self.models)
+        try:
+            belief = self._fit(self.models)
+        except Exception:
+            # Leave the agent exactly as it was, so that the failure can be
+            # reported and a retry does not absorb the datum twice.
+            self.dataset.pop()
+            if not key_was_used:
+                self.used_action_keys.discard(key)
+            self.experiments_run -= 1
+            self.active_model_cap = previous_cap
+            raise
+        self.belief = belief
 
         check_error = gate_error
-        for _ in range(self.config.model_search_rounds):
-            if check_error <= self.config.error_threshold or not self._expand():
-                break
-            check_error = (
-                in_sample_check(
-                    self.belief,
-                    self.dataset if self.config.backtest else [fresh],
-                    target=self.target,
-                    floor=self.config.predictive_floor,
+        try:
+            for _ in range(self.config.model_search_rounds):
+                if check_error <= self.config.error_threshold or not self._expand():
+                    break
+                check_error = (
+                    in_sample_check(
+                        self.belief,
+                        self.dataset if self.config.backtest else [fresh],
+                        target=self.target,
+                        floor=self.config.predictive_floor,
+                    )
+                    if self.check is None else self.check(self.belief, fresh, self.dataset[:-1])
                 )
-                if self.check is None else self.check(self.belief, fresh, self.dataset[:-1])
-            )
-
-        self._adapt_pool()
+        finally:
+            # The refitted pool is consistent with the data even if a proposer
+            # call failed part-way; keep the cap bookkeeping in step with it.
+            self._adapt_pool()
         return error
 
     def _check(self, fresh: Datum) -> float:
@@ -294,16 +332,22 @@ class ModelDiscoveryAgent:
         domain may supply ``check(belief, fresh, history)`` instead, compared
         against the same ``error_threshold``.
         """
-        if self.check is not None:
-            return float(self.check(self.belief, fresh, self.dataset))
-        return predictive_check(
-            self.belief,
-            fresh,
-            self.dataset,
-            target=self.target,
-            floor=self.config.predictive_floor,
-            backtest=self.config.backtest,
-        )
+        try:
+            if self.check is not None:
+                return float(self.check(self.belief, fresh, self.dataset))
+            return predictive_check(
+                self.belief,
+                fresh,
+                self.dataset,
+                target=self.target,
+                floor=self.config.predictive_floor,
+                backtest=self.config.backtest,
+            )
+        except (ValueError, ArithmeticError):
+            # The current best model cannot even evaluate this experiment
+            # (a domain error at the chosen design): the check fails rather
+            # than aborting after the experiment has already been run.
+            return np.inf
 
     def _expand(self) -> bool:
         """One ``expand-hyp-space`` call and re-judge; False if no call was allowed.

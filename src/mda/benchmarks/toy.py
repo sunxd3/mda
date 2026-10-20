@@ -8,7 +8,7 @@ import json
 import numpy as np
 
 from mda.agent import AgentConfig, ModelDiscoveryAgent
-from mda.expressions import SymbolicRegressionProposer, compile_expression
+from mda.expressions import SymbolicRegressionProposer, canonical_expression, compile_expression
 from mda.likelihoods import DeterministicGaussianLikelihood
 from mda.openai_client import OpenAIJSONClient
 from mda.smc import SMCConfig
@@ -18,7 +18,7 @@ from mda.types import CandidateModel, Datum, UniformPrior
 def _model(name: str, expression: str, names: tuple[str, ...]) -> CandidateModel:
     return CandidateModel(
         name=name,
-        structure=expression,
+        structure=canonical_expression(expression),
         prior=UniformPrior(names, np.full(len(names), -5.0), np.full(len(names), 5.0)),
         predict=compile_expression(expression, ("x",), names),
     )

@@ -49,13 +49,15 @@ class BeliefState:
         return self.fits[self.map_index]
 
     def iter_parameter_particles(self) -> Iterator[tuple[CandidateModel, np.ndarray, float]]:
-        """Weighted (model, theta) pairs with positive model weight."""
+        """Weighted (model, theta) pairs with positive mass."""
         for model_weight, fit in zip(self.model_weights, self.fits, strict=True):
             if model_weight == 0.0:
                 continue
             for theta, parameter_weight in zip(
                 fit.parameters.particles, fit.parameters.weights, strict=True
             ):
+                if parameter_weight == 0.0:
+                    continue
                 yield fit.model, theta, float(model_weight * parameter_weight)
 
 

@@ -15,6 +15,10 @@ CONSTANTS = (130.0, 95.0)
 PROTOCOLS = [dict(meal_g=30, meal_minute=60, bolus_U=1, bolus_minute=75),
              dict(meal_g=45, meal_minute=90, bolus_U=1.5, bolus_minute=90),
              dict(meal_g=60, meal_minute=120, bolus_U=0.5, bolus_minute=150)]
+# Glucose right-hand sides of SEED_SPECS[0] that parse but raise when evaluated.
+RAISING_RHS = ["p2*(gb*p3 - log(g, 10)) + p4*q - p5*i", "p2*(gb*p3 - minimum(g)) + p4*q - p5*i",
+               "p2*(gb*p3 - g) + p4*q - p5*i + 0*(1/0)", "p2*(gb*p3 - g) + p4*q - p5*i + 0*g*1e200**2",
+               "p2*(gb*p3 - g) + p4*q - p5*i + 0*g*10**400"]
 
 
 def synthetic_episode(protocol, key, rng, offset=0.0):
@@ -53,6 +57,16 @@ def test_nominal_delivery_and_observation_layout():
            "insulin_pmol_l": [float(t) if int(t) % 15 == 0 else None for t in g.CGM_TIMES]}
     observation = g.episode_observation(row)
     assert observation.shape == (98,) and observation[73:].tolist() == g.INSULIN_TIMES.tolist()
+
+
+@pytest.mark.parametrize("value", [None, float("nan")])
+def test_episode_observation_rejects_missing_scheduled_assays(value):
+    row = {"cgm_mg_dl": [120.0] * 73, "times_min": g.CGM_TIMES.tolist(),
+           "insulin_mask": [int(t) % 15 == 0 for t in g.CGM_TIMES],
+           "insulin_pmol_l": [(value if int(t) == 90 else 100.0) if int(t) % 15 == 0 else None
+                              for t in g.CGM_TIMES]}
+    with pytest.raises(ValueError, match="menu:3.*insulin assay at minute 90"):
+        g.episode_observation(row, "menu:3")
 
 
 def test_specifications_are_validated():
@@ -206,6 +220,101 @@ def test_proposer_drops_malformed_syntax_but_keeps_valid_siblings():
     proposer = g.GlucoseProposer(FakeClient([broken, valid]), constants)
     models = proposer.propose(context="", dataset=[], current_models=existing, residuals=(), count=2)
     assert [m.name for m in models] == ["valid"]
+
+
+def test_proposer_drops_models_that_raise_when_simulated(monkeypatch):
+    rng = np.random.default_rng(0)
+    constants = g.GlucoseConstants(*CONSTANTS)
+    existing = [g.glucose_candidate(spec, constants) for spec in g.SEED_SPECS]
+    dataset = [synthetic_episode(PROTOCOLS[0], "e0", rng)]
+    base = {**g.SEED_SPECS[0].to_dict(), "parent_ids": ["one_stage_linear_action"], "origin": "edit",
+            "edit_summary": "x"}
+    valid = {**base, "name": "valid", "rhs": [*base["rhs"][:2], "p2*(gb - g) + p3*q - p4*i"]}
+    for rhs in RAISING_RHS:
+        raising = {**base, "name": "raising", "rhs": [*base["rhs"][:2], rhs]}
+        for data in (dataset, []):  # screened on the first training episode, or a nominal schedule
+            proposer = g.GlucoseProposer(FakeClient([raising, valid]), constants)
+            models = proposer.propose(context="", dataset=data, current_models=existing, residuals=(), count=2)
+            assert [m.name for m in models] == ["valid"]
+    # A rollout that only diverges is not an error (fitting marks it invalid),
+    # and a RecursionError is dropped like any other evaluation error.
+    diverging = {**base, "name": "diverging", "rhs": [*base["rhs"][:2], "p2*g*g"]}
+    deep = {**valid, "name": "deep"}
+    simulate = g.GlucoseODE.simulate
+
+    def deep_raises(ode, *args):
+        if ode.spec.name == "deep":
+            raise RecursionError("maximum recursion depth exceeded")
+        return simulate(ode, *args)
+
+    monkeypatch.setattr(g.GlucoseODE, "simulate", deep_raises)
+    proposer = g.GlucoseProposer(FakeClient([deep, diverging]), constants)
+    models = proposer.propose(context="", dataset=dataset, current_models=existing, residuals=(), count=2)
+    assert [m.name for m in models] == ["diverging"]
+    assert np.isnan(models[0].predict(np.r_[g.SEED_SPECS[0].initial, 0.5, 3.0], dataset[0].action)).all()
+
+
+def test_evidence_fails_models_that_raise_without_aborting_the_posterior():
+    from mda.posterior import fit_model_posterior
+    rng = np.random.default_rng(0)
+    data = [synthetic_episode(p, f"e{i}", rng) for i, p in enumerate(PROTOCOLS[:2])]
+    constants = g.GlucoseConstants()
+    evidence = g.GlucoseEvidence(constants, g.GlucoseFitSettings(random_starts=1, max_iterations=5))
+    base = g.SEED_SPECS[0].to_dict()
+    raising = []
+    for rhs in RAISING_RHS:
+        try:
+            spec = g.GlucoseModelSpec.from_dict({**base, "name": f"raising{len(raising)}",
+                                                 "rhs": [*base["rhs"][:2], rhs]})
+        except ValueError:
+            continue  # rejected when compiled, e.g. by an arity check
+        raising.append(g.glucose_candidate(spec, constants))
+        assert evidence(data, raising[-1], None, rng).log_evidence == -np.inf
+    assert len(raising) >= 3  # the arithmetic errors parse and compile
+    seed = g.glucose_candidate(g.SEED_SPECS[0], constants)
+    belief = fit_model_posterior(data, [*raising, seed], None, None, model_cap=14, occam_penalty=0.0,
+                                 rng=rng, evidence=evidence)
+    assert [fit.model.name for fit in belief.fits] == [seed.name]
+
+
+def test_proposer_rejects_whitespace_and_parenthesis_variants_of_existing_models():
+    constants = g.GlucoseConstants(*CONSTANTS)
+    existing = [g.glucose_candidate(spec, constants) for spec in g.SEED_SPECS]
+    base = g.SEED_SPECS[2].to_dict()
+    variant = {**base, "name": "respaced", "rhs": [*base["rhs"][:3], "p3 * (gb * p4 - g) + (p5*q2) - p6*i*g/gb"],
+               "outputs": ["(g)", "ib + p7 * i"], "parent_ids": ["two_stage_meal"], "origin": "edit",
+               "edit_summary": "same model"}
+    assert g.GlucoseModelSpec.from_dict(variant).key == g.SEED_SPECS[2].key
+    proposer = g.GlucoseProposer(FakeClient([variant]), constants)
+    assert proposer.propose(context="", dataset=[], current_models=existing, residuals=(), count=2) == []
+
+
+def test_working_likelihood_reads_sigma_from_theta():
+    rng = np.random.default_rng(0)
+    data = [synthetic_episode(p, f"e{i}", rng) for i, p in enumerate(PROTOCOLS)]
+    constants = g.GlucoseConstants(*CONSTANTS)
+    model = g.glucose_candidate(g.SEED_SPECS[2], constants)
+    likelihood = g.GlucoseLikelihood(constants)
+    cgm, insulin = g._residuals(model.metadata["ode"], TRUTH[None], data, constants.values)
+    profiled, sigma_hat = g._negative_log_likelihood(cgm, insulin, np.array([0.7]))
+    values = {s: likelihood(data, model, np.r_[TRUTH, 0.7, s], None) for s in (1.0, sigma_hat[0], 1000.0)}
+    assert values[sigma_hat[0]] == pytest.approx(-profiled[0])  # the profiled sigma maximizes it
+    assert values[sigma_hat[0]] > values[1.0] > values[1000.0]
+
+
+def test_forecaster_drops_components_whose_ekf_state_diverges():
+    grow = g.GlucoseModelSpec("grow", ("g",), ("p0*meal*g",), ("gb",), ("g", "ib + 0*g"), ((1e-4, 1.0),), (0.2,))
+    ode, theta = g.GlucoseODE(grow), np.array([0.2])
+    datum = synthetic_episode(dict(meal_g=60, meal_minute=60, bolus_U=0, bolus_minute=60), "q",
+                              np.random.default_rng(0))
+    assert np.isnan(ode.simulate(theta[None], [datum.action], CONSTANTS)[0]).all()
+    cgm, insulin = g._ekf_forecast(ode, theta, 0.7, 3.0, CONSTANTS, payload(datum, 45))
+    assert np.isnan(cgm).all() and np.isnan(insulin).all()
+    good = (g.GlucoseODE(g.SEED_SPECS[2]), TRUTH, 0.7, 3.0, 0.99)
+    alone = g.GlucoseForecaster((good,), CONSTANTS)(payload(datum, 45))
+    mixed = g.GlucoseForecaster((good, (ode, theta, 0.7, 3.0, 0.01)), CONSTANTS)(payload(datum, 45))
+    np.testing.assert_allclose(mixed["cgm_mg_dl"], alone["cgm_mg_dl"])
+    np.testing.assert_allclose(mixed["insulin_pmol_l"], alone["insulin_pmol_l"])
 
 
 def test_forecaster_ignores_components_that_fail():

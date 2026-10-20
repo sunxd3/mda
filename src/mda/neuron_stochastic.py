@@ -23,14 +23,15 @@ from .neuronbench_adapter import (
     NeuronHypothesis,
     _neuronbench,
     evaluate_neuron_recovery,
+    fixed_scale_feature_mse,
     neuron_candidate,
     reference_neuron_candidate,
 )
 from .types import CandidateModel, Datum, StateSpaceModel
 
 
-# v5 Eq. hhFixedScaleMSE scales for [n_test, n_pre, run_down, adaptation, V_min, V_end].
-FEATURE_SCALES = np.array([3.0, 3.0, 3.0, 3.0, 12.0, 8.0])
+# Distinct (theta, protocol) rollouts whose summaries each candidate keeps.
+_ROLLOUT_CACHE_SIZE = 64
 
 
 def _protocol(protocol):
@@ -42,7 +43,9 @@ def stochastic_trace_features(trace, protocol):
     """Summarize the observed ~4 ms grid, not the deterministic ~0.1 ms grid.
 
     Coarse observations cannot recover spikes missed between samples. Forecasts
-    and held-out targets instead average features of full simulated traces.
+    and held-out targets instead average features of full simulated traces;
+    residual checks compare against ``metadata["observed_target_prediction"]``,
+    the same features averaged over rollouts sampled on this grid.
     """
     _, indices, start = _protocol(protocol)
     return _neuronbench().evaluator.eval_features(
@@ -146,9 +149,10 @@ def stochastic_neuron_candidate(
     if channel_count <= 0 or prediction_rollouts <= 0:
         raise ValueError("channel_count and prediction_rollouts must be positive")
     base = reference_neuron_candidate() if spec is None else neuron_candidate(spec)
+    summaries = {}
 
     def rollout(theta, action, count):
-        I, obs_idx, _ = _protocol(action)
+        I, obs_idx, test_start = _protocol(action)
         key = zlib.crc32(str(action[0]).encode())
         rng = np.random.default_rng(np.random.SeedSequence([seed, key]))
         state = _initial(theta, spec, count)
@@ -156,19 +160,41 @@ def stochastic_neuron_candidate(
         for index, applied in enumerate(I):
             state = _step(state, theta, spec, applied, rng, channel_count, 0.025)
             traces[:, index] = state[:, 0]
-        return traces, obs_idx
+        return traces, obs_idx, test_start
+
+    def summary(theta, action):
+        """One CRN rollout's (mean observed trace, fine-grid and observed-grid features).
+
+        Rollouts are seeded by protocol label, so all three predictors share
+        one; only these small summaries are cached, not the full traces.
+        """
+        theta = np.asarray(theta, dtype=float)
+        key = (theta.tobytes(), action[0], repr(action[1]), prediction_rollouts)
+        if key in summaries:
+            summaries[key] = summaries.pop(key)
+            return summaries[key]
+        features = _neuronbench().evaluator.eval_features
+        traces, obs_idx, test_start = rollout(theta, action, prediction_rollouts)
+        observed = traces[:, obs_idx]
+        observed_start = int(np.searchsorted(obs_idx, test_start))
+        if len(summaries) >= _ROLLOUT_CACHE_SIZE:
+            summaries.pop(next(iter(summaries)))
+        summaries[key] = (
+            observed.mean(axis=0),
+            np.mean([features(trace, test_start) for trace in traces], axis=0),
+            np.mean([features(trace, observed_start) for trace in observed], axis=0),
+        )
+        return summaries[key]
 
     def predict(theta, action):
-        traces, obs_idx = rollout(theta, action, prediction_rollouts)
-        return traces[:, obs_idx].mean(axis=0)
+        return summary(theta, action)[0].copy()
 
     def predict_target(theta, action):
-        nb = _neuronbench()
-        traces, _ = rollout(theta, action, prediction_rollouts)
-        _, _, test_start = _protocol(action)
-        return np.mean(
-            [nb.evaluator.eval_features(trace, test_start) for trace in traces], axis=0
-        )
+        return summary(theta, action)[1].copy()
+
+    def observed_target_prediction(theta, action):
+        # Same features as ``stochastic_trace_features`` of an observation.
+        return summary(theta, action)[2].copy()
 
     def initial(theta, action, particles, rng):
         del action, rng
@@ -198,6 +224,7 @@ def stochastic_neuron_candidate(
             "channel_count": channel_count,
             "prediction_rollouts": prediction_rollouts,
             "observation_std_mv": 2.0,
+            "observed_target_prediction": observed_target_prediction,
         },
     )
 
@@ -265,10 +292,4 @@ class StochasticNeuronBenchEnvironment:
             seed=self.seed,
             reps=200,
         )
-        truth = np.stack([targets[p[0]][0] for p in self.query_actions])
-        forecast = np.stack(
-            [np.asarray(predictor(p), float) for p in self.query_actions]
-        )
-        if forecast.shape != truth.shape:
-            raise ValueError("predictor features must match held-out feature shape")
-        return float(np.mean(((forecast - truth) / FEATURE_SCALES) ** 2))
+        return fixed_scale_feature_mse(targets, self.query_actions, predictor)

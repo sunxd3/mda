@@ -36,6 +36,17 @@ class TemperedSMCEvidence:
         return parameter_posterior(dataset, model, likelihood, self.config, rng)
 
 
+def _cache_key(model: CandidateModel) -> tuple:
+    """Structure plus prior support: one key per structure would let a law
+    re-proposed with different bounds inherit a posterior outside them."""
+    prior = model.prior
+    bounds = tuple(
+        np.asarray(getattr(prior, name), dtype=float).tobytes()
+        for name in ("lower", "upper") if hasattr(prior, name)
+    )
+    return (model.key, *bounds)
+
+
 def _is_prefix(old: Sequence[Datum], new: Sequence[Datum]) -> bool:
     return len(old) <= len(new) and all(a is b for a, b in zip(old, new))
 
@@ -70,14 +81,15 @@ class RecursiveEvidence:
 
     def __call__(self, dataset, model, likelihood, rng) -> ParameterPosterior:
         dataset = tuple(dataset)
-        cached = self._states.get(model.key)
+        key = _cache_key(model)
+        cached = self._states.get(key)
         if cached is None or not _is_prefix(cached[0], dataset):
             posterior = self.initial(dataset, model, likelihood, rng)
         else:
             posterior = cached[1]
             for datum in dataset[len(cached[0]):]:
                 posterior = self._assimilate(posterior, datum, model, likelihood, rng)
-        self._states[model.key] = (dataset, posterior)
+        self._states[key] = (dataset, posterior)
         return posterior
 
     def _assimilate(self, posterior, datum, model, likelihood, rng) -> ParameterPosterior:
@@ -191,7 +203,7 @@ class BICEvidence:
                 rng_eval = np.random.default_rng(self.likelihood_seed)
                 try:
                     value = float(likelihood(dataset, model, np.asarray(theta), rng_eval))
-                except (FloatingPointError, OverflowError, ValueError):
+                except (ArithmeticError, ValueError):
                     return np.inf
                 return -value if np.isfinite(value) else np.inf
 
@@ -216,7 +228,7 @@ class BICEvidence:
                         model.observation_prediction(theta, datum.action).reshape(-1)
                         for datum in dataset
                     ])
-                except (FloatingPointError, OverflowError, ValueError):
+                except (ArithmeticError, ValueError):
                     return None
                 if predicted.shape != observed.shape:
                     raise ValueError("model predictions do not match the observation shapes")
@@ -264,7 +276,7 @@ class BICEvidence:
             try:
                 fit = least_squares(safe, start, bounds=(lower, upper),
                                     max_nfev=self.max_evaluations, x_scale="jac")
-            except (FloatingPointError, OverflowError, ValueError):
+            except (ArithmeticError, ValueError):
                 continue
             values = residuals(fit.x)
             if values is None or not np.all(np.isfinite(values)):

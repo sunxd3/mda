@@ -17,7 +17,7 @@ from typing import Any, Callable, Mapping
 
 import numpy as np
 
-from .types import CandidateModel
+from .types import CandidateModel, NonFinitePrediction
 
 
 def _imports():
@@ -175,8 +175,10 @@ def compile_numpyro_model(
             raise ValueError("NumPyro model must define numpyro.deterministic('mu', value)")
         mu = np.asarray(trace["mu"]["value"], dtype=float)
         rows = feature_rows.shape[0]
-        if mu.ndim == 0 or mu.shape[0] != rows or np.any(~np.isfinite(mu)):
-            raise ValueError(f"mu must be finite with leading shape ({rows},), got {mu.shape}")
+        if mu.shape != (rows,):
+            raise ValueError(f"mu must have shape ({rows},), got {mu.shape}")
+        if np.any(~np.isfinite(mu)):
+            raise NonFinitePrediction(f"NumPyro model {name!r} returned a non-finite mu")
         return mu
 
     # Validate eagerly, including missing/invalid mu.

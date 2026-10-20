@@ -39,7 +39,7 @@ from typing import Any
 import numpy as np
 
 from mda.agent import AgentConfig, ModelDiscoveryAgent
-from mda.expressions import _FUNCTIONS, compile_expressions
+from mda.expressions import _FUNCTIONS, canonical_expression, compile_expressions
 from mda.posterior import BeliefState
 from mda.smc import ParameterPosterior
 from mda.types import CandidateModel, Datum, UniformPrior
@@ -59,6 +59,8 @@ INPUT_NAMES = ("meal", "insulin")
 MAX_STATES, MAX_PARAMETERS = 6, 12
 RHO_BOUNDS = (0.0, 0.99)  # local choice
 _DIVERGENCE = 1e7  # rollouts beyond this magnitude are invalid
+# Errors a parseable expression can still raise when evaluated (e.g. 1/0, 1e200**2).
+_EVALUATION_ERRORS = (ArithmeticError, TypeError, ValueError, KeyError, RecursionError)
 _PENALTY = 1e20
 
 GLUCOSE_PROPOSER_SYSTEM = (
@@ -153,14 +155,22 @@ def episode_inputs(row: Mapping[str, Any], key: str) -> GlucoseInputs:
     return GlucoseInputs(key, columns[:, 1], columns[:, 3], dict(row.get("protocol", {})))
 
 
-def episode_observation(row: Mapping[str, Any]) -> np.ndarray:
-    """CGM at the 73 sample times followed by the 25 scheduled insulin assays."""
+def episode_observation(row: Mapping[str, Any], key: str = "episode") -> np.ndarray:
+    """CGM at the 73 sample times followed by the 25 scheduled insulin assays.
+
+    A missing or non-finite scheduled value raises, naming ``key`` and the
+    minute, rather than giving every model an infinite likelihood.
+    """
     cgm = np.asarray(row["cgm_mg_dl"], dtype=float)
     mask = np.asarray(row["insulin_mask"], dtype=bool)
     times = np.asarray(row["times_min"], dtype=float)
     if cgm.shape != (73,) or not np.array_equal(times[mask], INSULIN_TIMES):
         raise ValueError("expected 73 CGM readings and assays every 15 minutes")
     insulin = np.asarray([row["insulin_pmol_l"][i] for i in np.flatnonzero(mask)], dtype=float)
+    for label, values, minutes in (("CGM reading", cgm, CGM_TIMES), ("insulin assay", insulin, INSULIN_TIMES)):
+        missing = np.flatnonzero(~np.isfinite(values))
+        if missing.size:
+            raise ValueError(f"{key}: the {label} at minute {int(minutes[missing[0]])} is missing or non-finite")
     return np.concatenate([cgm, insulin])
 
 
@@ -250,8 +260,10 @@ class GlucoseModelSpec:
 
     @property
     def key(self) -> str:
-        """Exact-expression identity used to deduplicate proposals."""
-        return json.dumps([self.states, self.rhs, self.initial_states, self.outputs])
+        """Expression identity, up to whitespace and redundant parentheses, used to deduplicate proposals."""
+        expressions = [[canonical_expression(e) for e in group]
+                       for group in (self.rhs, self.initial_states, self.outputs)]
+        return json.dumps([self.states, *expressions])
 
     def to_dict(self) -> dict[str, Any]:
         return {"name": self.name, "states": list(self.states), "rhs": list(self.rhs),
@@ -349,11 +361,12 @@ class GlucoseODE:
 # Likelihood, BIC evidence, and the expansion gate
 # ---------------------------------------------------------------------------
 
-def _negative_log_likelihood(cgm_residual, insulin_residual, rho):
+def _negative_log_likelihood(cgm_residual, insulin_residual, rho, sigma=None):
     """AR(1) CGM residuals with profiled innovation variance plus Gaussian assays.
 
     Residual arrays are ``(B, E, T)`` from minute 45; ``rho`` is ``(B,)``.
-    Returns the minimized negative log likelihood and the profiled sigma_eta.
+    Returns the minimized negative log likelihood and the profiled sigma_eta,
+    or, given ``sigma`` ``(B,)``, the value at that innovation SD and ``sigma``.
     """
     rho = np.asarray(rho, dtype=float)
     innovations = np.empty_like(cgm_residual)
@@ -361,8 +374,14 @@ def _negative_log_likelihood(cgm_residual, insulin_residual, rho):
     innovations[..., 1:] = cgm_residual[..., 1:] - rho[:, None, None] * cgm_residual[..., :-1]
     episodes, n_cgm = cgm_residual.shape[1], cgm_residual.shape[1] * cgm_residual.shape[2]
     n_insulin = insulin_residual.shape[1] * insulin_residual.shape[2]
-    variance = np.maximum(np.sum(innovations**2, axis=(1, 2)) / n_cgm, np.finfo(float).tiny)
-    nll = (0.5 * n_cgm * (np.log(2 * np.pi * variance) + 1) - 0.5 * episodes * np.log(1 - rho**2)
+    squares = np.sum(innovations**2, axis=(1, 2))
+    if sigma is None:
+        variance = np.maximum(squares / n_cgm, np.finfo(float).tiny)
+        cgm_term = 0.5 * n_cgm * (np.log(2 * np.pi * variance) + 1)
+    else:
+        variance = np.asarray(sigma, dtype=float) ** 2
+        cgm_term = 0.5 * n_cgm * np.log(2 * np.pi * variance) + 0.5 * squares / variance
+    nll = (cgm_term - 0.5 * episodes * np.log(1 - rho**2)
            + 0.5 * np.sum(insulin_residual**2, axis=(1, 2)) / ASSAY_SD**2
            + 0.5 * n_insulin * np.log(2 * np.pi * ASSAY_SD**2))
     return np.where(np.isfinite(nll), nll, np.inf), np.sqrt(variance)
@@ -379,8 +398,9 @@ def _residuals(ode, theta, dataset, constants):
 class GlucoseLikelihood:
     """Working log likelihood at ``theta = (ODE parameters, rho, sigma_eta)``.
 
-    sigma_eta is profiled rather than read from ``theta``. Only used outside
-    the BIC backend, e.g. if an SMC backend is selected.
+    Only used outside the BIC backend, e.g. if an SMC backend is selected;
+    ``ModelDiscoveryAgent`` requires a likelihood. Expressions that raise when
+    evaluated give a log likelihood of -inf.
     """
 
     constants: GlucoseConstants
@@ -389,8 +409,12 @@ class GlucoseLikelihood:
         del rng
         ode = model.metadata["ode"]
         theta = np.asarray(theta, dtype=float)
-        cgm, insulin = _residuals(ode, theta[None, :ode.k], dataset, self.constants.values)
-        return -float(_negative_log_likelihood(cgm, insulin, theta[None, ode.k])[0][0])
+        try:
+            cgm, insulin = _residuals(ode, theta[None, :ode.k], dataset, self.constants.values)
+        except _EVALUATION_ERRORS:
+            return -np.inf
+        nll, _ = _negative_log_likelihood(cgm, insulin, theta[None, ode.k], theta[None, ode.k + 1])
+        return -float(nll[0])
 
 
 @dataclass(frozen=True)
@@ -408,7 +432,8 @@ class GlucoseEvidence:
     model's previous optimum (warm start), its declared initial values, and
     ``random_starts`` log-uniform draws. BIC = 2 NLL + (k + 2) log N with N
     the number of observed targets from minute 45. A model whose every start
-    fails gets zero evidence and leaves the pool. The returned point mass is
+    fails, including one whose expressions raise when evaluated, gets zero
+    evidence and leaves the pool. The returned point mass is
     ``(theta_hat, rho_hat, sigma_eta_hat)``.
     """
 
@@ -433,7 +458,10 @@ class GlucoseEvidence:
 
         def batch(x_rows):
             x_rows = np.atleast_2d(x_rows)
-            cgm, insulin = _residuals(ode, np.exp(x_rows[:, :k]), dataset, constants)
+            try:
+                cgm, insulin = _residuals(ode, np.exp(x_rows[:, :k]), dataset, constants)
+            except _EVALUATION_ERRORS:  # an expression that raises is an invalid rollout
+                return np.full(len(x_rows), np.inf), np.full(len(x_rows), np.nan)
             return _negative_log_likelihood(cgm, insulin, x_rows[:, k])
 
         def objective(x):
@@ -618,7 +646,9 @@ def _ekf_forecast(ode, theta, rho, sigma, constants, payload) -> tuple[np.ndarra
     on the five-minute grid. Jacobians are finite differences of the five-
     minute RK4 flow (local choice), the initial ODE-state SD is 5% of its
     magnitude with a unit floor (local choice), and CGM updates use a 1e-6
-    jitter because the sensor error is already a state.
+    jitter because the sensor error is already a state. As in ``simulate``, a
+    state that becomes non-finite or reaches ``_DIVERGENCE`` voids the whole
+    forecast (all NaN), so the mixture drops the component.
     """
     query, cut = payload["query"], int(payload["forecast_cut_min"])
     inputs = episode_inputs(query, "query")
@@ -630,6 +660,11 @@ def _ekf_forecast(ode, theta, rho, sigma, constants, payload) -> tuple[np.ndarra
     cgm_seen = list(query["cgm_mg_dl"])
     insulin_seen, insulin_mask = list(query["insulin_pmol_l"]), list(query["insulin_mask"])
     cgm_pred, insulin_pred = np.empty(73), np.empty(25)
+    failed = np.full(73, np.nan), np.full(25, np.nan)
+
+    def diverged():
+        state = np.r_[z, e]
+        return not (np.all(np.isfinite(state)) and np.all(np.abs(state) < _DIVERGENCE))
 
     def outputs(states):
         c, i = ode.outputs(states[:, :, None], values)
@@ -672,6 +707,8 @@ def _ekf_forecast(ode, theta, rho, sigma, constants, payload) -> tuple[np.ndarra
                 transition[n, n] = rho
                 covariance = transition @ covariance @ transition.T
                 covariance[n, n] += sigma**2
+        if diverged():
+            return failed
         if filtering:
             c, i, dc, di = jacobian_outputs(z)
             update(float(cgm_seen[index]), c + e, np.r_[dc, 1.0], 1e-6)
@@ -679,6 +716,8 @@ def _ekf_forecast(ode, theta, rho, sigma, constants, payload) -> tuple[np.ndarra
                 c, i, dc, di = jacobian_outputs(z)
                 update(float(insulin_seen[index]), i, np.r_[di, 0.0], ASSAY_SD**2)
             covariance = (covariance + covariance.T) / 2
+            if diverged():
+                return failed
         c, i = outputs(z[:, None])
         cgm_pred[index] = c[0] + e
         if t % 15 == 0:
@@ -765,9 +804,11 @@ class GlucoseProposer:
 
     The payload holds the training observations, the delivery description,
     and each existing model's specification, fitted parameters, BIC, and
-    rounded training predictions. Invalid specifications and inconsistent
+    rounded training predictions. Invalid specifications, inconsistent
     genealogy (an edit needs one existing parent, a recombination two or more
-    distinct ones, de novo none) are dropped.
+    distinct ones, de novo none), and models whose expressions raise when
+    simulated once at their declared parameter values are dropped; a rollout
+    that merely diverges is kept, since fitting treats it as invalid.
     """
 
     def __init__(self, client, constants: GlucoseConstants) -> None:
@@ -799,6 +840,9 @@ class GlucoseProposer:
                                       name="glucose_models", max_tokens=6000)
         names = {model.name for model in current_models}
         keys = {model.key for model in current_models}
+        # Screening inputs: the first training episode, or a nominal schedule before any data.
+        screen = [dataset[0].action] if dataset else [
+            nominal_inputs(dict(meal_g=50, meal_minute=60, bolus_U=1, bolus_minute=60), "screen")]
         models = []
         for item in answer.get("models", [])[:min(2, count)]:
             try:
@@ -810,9 +854,10 @@ class GlucoseProposer:
                 if (origin, len(parents)) not in {("edit", 1), ("de_novo", 0)} and not (
                         origin == "recombination" and len(parents) >= 2):
                     raise ValueError("genealogy inconsistent with origin")
-            except (KeyError, TypeError, ValueError):
-                continue
-            if spec.key in keys:
+                if spec.key in keys:
+                    continue
+                GlucoseODE(spec).simulate(np.asarray(spec.initial)[None], screen, self.constants.values)
+            except _EVALUATION_ERRORS:
                 continue
             name, suffix = spec.name, 2
             while name in names:
@@ -901,8 +946,9 @@ class GlucoseBenchEnvironment:
     def __init__(self, patient: str, *, replicate: int = 0) -> None:
         self.benchmark = _glucosebench().Benchmark(patient, replicate)
         self.patient, self.replicate = patient, replicate
-        self.initial_data = [Datum(episode_inputs(row, f"passive:{index}"), episode_observation(row))
-                             for index, row in enumerate(self.benchmark.training)]
+        self.initial_data = [
+            Datum(episode_inputs(row, f"passive:{index}"), episode_observation(row, f"passive:{index}"))
+            for index, row in enumerate(self.benchmark.training)]
         self.menu = dict(self.benchmark.actions)
         self.context = ("Forecast one simulated type-1 diabetes patient's CGM and plasma insulin "
                         "responses to meal and bolus interventions.")
@@ -910,7 +956,7 @@ class GlucoseBenchEnvironment:
     def step(self, action: GlucoseInputs) -> tuple[GlucoseInputs, np.ndarray]:
         """Run a menu template; return its delivered inputs and observation vector."""
         row = self.benchmark.observe(int(action.key.split(":", 1)[1]))
-        return episode_inputs(row, action.key), episode_observation(row)
+        return episode_inputs(row, action.key), episode_observation(row, action.key)
 
     def freeze(self):
         return self.benchmark.freeze()

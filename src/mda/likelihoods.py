@@ -50,7 +50,7 @@ class DeterministicGaussianLikelihood:
                     else self.observation_std
                 )
                 total += _normal_logpdf(datum.observation, prediction, std)
-        except (FloatingPointError, OverflowError, ValueError):
+        except (ArithmeticError, ValueError):
             return -np.inf
         return total if np.isfinite(total) else -np.inf
 
@@ -58,6 +58,8 @@ class DeterministicGaussianLikelihood:
 def _simulate_traces(model, theta, datum, count, std, rng) -> np.ndarray:
     """Draw ``count`` noisy trajectories with the datum's shape from the SSM."""
     observations = np.asarray(datum.observation, dtype=float)
+    if observations.ndim > 2:
+        raise ValueError("synthetic-likelihood observations must have shape (time, features)")
     shape = observations.shape if observations.ndim == 2 else (observations.size, 1)
     state_model = model.state_space
     states = np.asarray(state_model.initial_state(theta, datum.action, count, rng), dtype=float)
@@ -108,6 +110,9 @@ class BayesianSyntheticLikelihood:
         std = np.asarray(self.observation_std, dtype=float)
         if np.any(~np.isfinite(std)) or np.any(std <= 0):
             raise ValueError("observation standard deviations must be finite and positive")
+        # Shape problems are configuration errors and must not become -inf below.
+        if any(np.asarray(datum.observation, dtype=float).ndim > 2 for datum in dataset):
+            raise ValueError("synthetic-likelihood observations must have shape (time, features)")
         total = 0.0
         try:
             for datum in dataset:
@@ -132,7 +137,7 @@ class BayesianSyntheticLikelihood:
                     + 2 * np.sum(np.log(np.diag(cholesky)))
                     + len(mean) * np.log(2 * np.pi)
                 )
-        except (FloatingPointError, OverflowError, ValueError, np.linalg.LinAlgError):
+        except (ArithmeticError, ValueError):  # LinAlgError is a ValueError
             return -np.inf
         return total if np.isfinite(total) else -np.inf
 

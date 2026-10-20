@@ -27,7 +27,7 @@ import numpy as np
 
 from mda.agent import AgentConfig, ModelDiscoveryAgent
 from mda.evidence import BICEvidence
-from mda.expressions import SymbolicRegressionProposer, compile_expression
+from mda.expressions import SymbolicRegressionProposer, canonical_expression, compile_expression
 from mda.likelihoods import DeterministicGaussianLikelihood
 from mda.optimizers import CMAESOptimizer
 from mda.smc import SMCConfig
@@ -106,7 +106,7 @@ def canonical_models() -> list[CandidateModel]:
     for name, expression, params in CANONICAL_LAWS:
         names = tuple(param[0] for param in params)
         models.append(CandidateModel(
-            name=name, structure=expression,
+            name=name, structure=canonical_expression(expression),
             prior=UniformPrior(names, np.array([p[1] for p in params]), np.array([p[2] for p in params])),
             predict=compile_expression(expression, VARIABLE_NAMES, names),
         ))
@@ -211,7 +211,10 @@ class ChemBenchEnvironment:
         del parameters  # Recovery refits constants rather than scoring their learned values.
         from .recovery import canonical_symbolic_candidate, evaluate_recovery
         canonical = canonical_symbolic_candidate(model.structure, VARIABLE_NAMES, model.prior)
-        truth = lambda action: np.asarray(self.evaluation_oracle.run(action).measurement)
+        # The clean primary law, as for the held-out metrics: the oracle's
+        # measurement carries noise and secondary T/pH effects that put even
+        # the true law near the recovery tolerance.
+        truth = lambda action: np.asarray(self._reference(action))
         parameters, rmsle, recovered = evaluate_recovery(
             canonical, (_sample_actions(128, 43), _sample_actions(128, 44)),
             (truth, truth), tolerance=.02,

@@ -95,6 +95,14 @@ class AnthropicJSONClient:
         max_tokens: int = 800,
         response_format: dict[str, Any] | None = None,
     ) -> str:
+        """Return the forced tool call's input as compact JSON text.
+
+        ``temperature`` is accepted for parity with ``OpenAIJSONClient`` but is
+        not used: it is neither sent nor part of the cache key, because Opus 4.7
+        rejects sampling parameters. Requests are streamed so that any
+        ``max_tokens`` is accepted; the SDK refuses large non-streaming budgets.
+        Only a response that stopped at the forced tool call is cached.
+        """
         output_format = response_format or {"type": "json_object"}
         schema = output_format.get("schema")
         if schema is None:
@@ -109,7 +117,6 @@ class AnthropicJSONClient:
             "user": prompt,
             "schema": schema,
             "tool_name": tool_name,
-            "temperature": temperature,
             "token_limit": max_tokens,
         }
         cache_path = self._cache_path(effective_request)
@@ -127,15 +134,19 @@ class AnthropicJSONClient:
         }
         if output_format.get("type") == "json_schema":
             tool["strict"] = True
-        response = self._sdk_client().messages.create(
+        with self._sdk_client().messages.stream(
             model=self.model,
             system=system,
             messages=[{"role": "user", "content": prompt}],
-            temperature=temperature,
             max_tokens=max_tokens,
             tools=[tool],
             tool_choice={"type": "tool", "name": tool_name},
-        )
+        ) as stream:
+            response = stream.get_final_message()
+        # A tool input cut off by max_tokens or a refusal can still parse.
+        stop_reason = getattr(response, "stop_reason", None)
+        if stop_reason != "tool_use":
+            raise RuntimeError(f"Anthropic response did not complete: {stop_reason}")
         tool_inputs = [
             block.get("input") if isinstance(block, dict) else getattr(block, "input", None)
             for block in getattr(response, "content", ())
@@ -161,6 +172,7 @@ class AnthropicJSONClient:
         temperature: float = 0.3,
         max_tokens: int = 1600,
     ) -> dict[str, Any]:
+        """Return the strict-schema tool input; ``temperature`` is unused (see ``ask``)."""
         text = self.ask(
             system, prompt, temperature=temperature, max_tokens=max_tokens,
             response_format={

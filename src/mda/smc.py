@@ -31,8 +31,8 @@ class SMCConfig:
             raise ValueError("parameter_particles must be positive")
         if self.rejuvenation_steps < 0:
             raise ValueError("rejuvenation_steps cannot be negative")
-        if not 0 < self.target_ess_fraction <= 1:
-            raise ValueError("target_ess_fraction must be in (0, 1]")
+        if not 0 < self.target_ess_fraction < 1:
+            raise ValueError("target_ess_fraction must be in (0, 1)")
         if self.max_temperatures < 1:
             raise ValueError("max_temperatures must be positive")
         if self.proposal_scale <= 0 or self.minimum_proposal_scale <= 0:
@@ -76,7 +76,7 @@ def _evaluate_likelihoods(
     for index, theta in enumerate(particles):
         try:
             value = float(likelihood(dataset, model, theta, rng))
-        except (FloatingPointError, OverflowError, ValueError):
+        except (ArithmeticError, ValueError):
             value = -np.inf
         values[index] = value if np.isfinite(value) else -np.inf
     return values

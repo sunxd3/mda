@@ -15,7 +15,7 @@ from typing import Any
 import numpy as np
 
 from mda.agent import AgentConfig, ModelDiscoveryAgent
-from mda.expressions import compile_expression
+from mda.expressions import canonical_expression, compile_expression, screen_candidate
 from mda.likelihoods import DeterministicGaussianLikelihood
 from mda.smc import SMCConfig
 from mda.types import CandidateModel, Datum, UniformPrior
@@ -147,7 +147,7 @@ def force_candidate(name: str, expression: str, parameter_names: Sequence[str],
         trajectory = np.asarray(output)
         return trajectory if world == "circle" else trajectory[:, 21:26]
 
-    return CandidateModel(name, prior, predict, structure=expression,
+    return CandidateModel(name, prior, predict, structure=canonical_expression(expression),
                           metadata={"world": world})
 
 
@@ -162,7 +162,8 @@ class ForceProposer:
         prompt = f"""{context}\nPropose {count} parsimonious central all-pair force
 magnitudes f(r,qi,qj,t). Positive means attraction. qi is response weight and
 qj source weight. Return finite LLM-declared uniform bounds for every unknown.
-The external acceleration coefficient is fitted separately, not part of the central expression.
+The external acceleration coefficient is fitted separately, not part of the central expression;
+its name ({"alpha" if self.world == "ether" else "H" if self.world == "hubble" else "none"}) is reserved.
 Observed experiments: {json.dumps(observations)}
 Existing structures and priors: {json.dumps(models_with_priors)}; residuals: {list(residuals)}"""
         parameter = {"type":"object", "properties":{"name":{"type":"string"},
@@ -179,12 +180,12 @@ Existing structures and priors: {json.dumps(models_with_priors)}; residuals: {li
         for spec in payload.get("hypotheses", []):
             try:
                 p = spec["params"]
-                model = force_candidate(spec["name"], spec["expr"], [x["name"] for x in p],
-                    [x["low"] for x in p], [x["high"] for x in p], world=self.world)
-                if model.key not in existing:
-                    model.observation_prediction(model.prior.sample(np.random.default_rng(0),1)[0], dataset[0].action)
+                model = force_candidate(spec["name"].strip(), spec["expr"].strip(),
+                    [x["name"] for x in p], [x["low"] for x in p], [x["high"] for x in p],
+                    world=self.world)
+                if model.key not in existing and screen_candidate(model, dataset, actions=1):
                     models.append(model); existing.add(model.key)
-            except (KeyError, TypeError, ValueError, FloatingPointError): pass
+            except (KeyError, TypeError, ValueError, RuntimeError, ArithmeticError): pass
         return models[:count]
 
 

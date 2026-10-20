@@ -37,7 +37,7 @@ class Prior(Protocol):
     def logpdf(self, theta: Array) -> float: ...
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class Datum:
     """One intervention/design and its observed scalar, vector, or trajectory."""
 
@@ -102,7 +102,7 @@ class StateSpaceModel:
     observation_mean: Callable[[Array, Array, Any, int], Array]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class CandidateModel:
     """One model-structure particle and its parameter prior."""
 

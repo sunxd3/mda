@@ -122,3 +122,51 @@ def test_budget_beyond_the_unused_menu_fails_before_running():
     env, agent = build("boxing", "death", None, seed=1, smoke=True, budget=1000)
     with pytest.raises(ValueError, match="unused designs"):
         run(env, agent, budget=len(agent.available_actions()) + 1, smoke=True)
+
+
+def test_an_aborted_run_hands_back_its_completed_snapshots():
+    from mda.benchmarks.reproduce import RunAborted
+
+    env, agent = build("boxing", "death", None, seed=4, smoke=True, budget=3)
+    steps = []
+    original = env.step
+
+    def failing_step(action):
+        if len(steps) == 1:
+            raise RuntimeError("instrument offline")
+        steps.append(action)
+        return original(action)
+
+    env.step = failing_step
+    with pytest.raises(RunAborted, match="instrument offline") as aborted:
+        run(env, agent, budget=3, smoke=True)
+    history = aborted.value.result["history"]
+    assert [r["experiments"] for r in history] == [0, 1]
+    json.dumps(aborted.value.result, default=_json_default, allow_nan=False)
+
+
+def test_icl_failure_is_recorded_beside_the_run_not_fatal():
+    env, agent = build("boxing", "death", None, seed=4, smoke=True, budget=1)
+
+    class WrongLength:
+        def ask_json(self, system, prompt, **kwargs):
+            return {"predictions": [0.5]}
+
+    result = run(env, agent, budget=1, smoke=True, icl_client=WrongLength())
+    assert len(result["history"]) == 2
+    assert all(r["icl_score"] is None and "icl_error" in r for r in result["history"])
+
+
+@pytest.mark.parametrize("argv", [
+    ["boxing", "--world", "death", "--smoke", "--difficulty", "hard"],
+    ["boxing", "--world", "death", "--smoke", "--cuts", "45"],
+    ["chemistry", "--world", "c0", "--smoke", "--allow-code-execution"],
+    ["boxing", "--world", "death", "--smoke", "--task-noise-variance", "0.1"],
+    ["boxing", "--world", "death", "--smoke", "--model", "gpt-5.6"],
+    ["boxing", "--world", "death", "--smoke", "--cache-dir", "/tmp/x"],
+])
+def test_cli_rejects_flags_that_would_have_no_effect(monkeypatch, tmp_path, argv):
+    monkeypatch.setattr("sys.argv", ["mda-reproduce", *argv, "--output", str(tmp_path / "result.json")])
+    with pytest.raises(SystemExit) as error:
+        main()
+    assert error.value.code == 2

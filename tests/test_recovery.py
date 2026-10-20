@@ -108,3 +108,17 @@ def test_recovery_threshold_is_strict():
     )
     assert rmsle == pytest.approx(1.0)
     assert not recovered
+
+
+def test_refit_skips_starts_where_the_law_is_undefined():
+    # sqrt(x - c) is undefined for c above the smallest input; the optimizer
+    # may visit such c on its way, which must not abort the recovery.
+    model = _model("a*sqrt(x - c)", ("a", "c"), (0.1, -1.0), (5.0, 2.5), )
+    fit = np.linspace(1.0, 4.0, 25)
+    holdout = np.linspace(1.1, 3.9, 20)
+    truth = lambda x: 2.0 * np.sqrt(x - 0.5)
+    parameters, rmsle, recovered = evaluate_recovery(model, (fit, holdout), (truth, truth), seed=1)
+    assert recovered and parameters == pytest.approx([2.0, 0.5], rel=1e-4)
+    undefined = _model("a*sqrt(x - c)", ("a", "c"), (0.1, 10.0), (5.0, 20.0))
+    with pytest.raises(ValueError, match="finite residuals"):
+        evaluate_recovery(undefined, (fit, holdout), (truth, truth), seed=1)

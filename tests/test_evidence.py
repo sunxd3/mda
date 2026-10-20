@@ -195,3 +195,35 @@ def test_bic_transform_scores_residuals_in_log_space():
                              lambda theta, x: np.asarray(-2.0))
     rejected = BICEvidence(transform=np.log1p)(data, invalid, None, np.random.default_rng(0))
     assert rejected.log_evidence == -np.inf
+
+
+def test_recursive_evidence_refits_when_the_same_structure_returns_with_new_bounds():
+    calls = []
+
+    def initial(dataset, model, likelihood, rng):
+        calls.append(float(model.prior.upper[0]))
+        return TemperedSMCEvidence(SMCConfig(parameter_particles=16))(dataset, model, likelihood, rng)
+
+    rng = np.random.default_rng(6)
+    data = [Datum(float(i), np.asarray(0.0)) for i in range(2)]
+    backend = RecursiveEvidence(initial)
+    likelihood = DeterministicGaussianLikelihood(1.0)
+    backend(data, constant_model(-5.0, 5.0), likelihood, rng)
+    wider = backend(data, constant_model(-5.0, 50.0), likelihood, rng)
+    assert calls == [5.0, 50.0]
+    assert np.all(wider.particles <= 50.0)
+
+
+def test_bsl_rejects_observations_the_particle_filter_rejects():
+    model = CandidateModel(
+        "level", UniformPrior(("mu",), np.array([-1.0]), np.array([1.0])),
+        lambda theta, x: np.full(8, theta[0]),
+        state_space=StateSpaceModel(
+            initial_state=lambda theta, action, count, rng: np.zeros((count, 1)),
+            transition=lambda states, theta, action, index, rng: states,
+            observation_mean=lambda states, theta, action, index: states[:, 0],
+        ),
+    )
+    likelihood = BayesianSyntheticLikelihood(lambda y, a: y, simulations=4, observation_std=1.0)
+    with pytest.raises(ValueError, match="shape"):
+        likelihood([Datum(0.0, np.zeros((3, 2, 2)))], model, np.array([0.0]), np.random.default_rng(0))
