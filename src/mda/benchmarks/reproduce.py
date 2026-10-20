@@ -264,14 +264,17 @@ def main():
     client = None
     provider = args.provider or ("anthropic" if args.domain == "boxing" else "openai")
     if not args.smoke:
+        # Seeds are independent LLM draws: identical requests from different
+        # runs (e.g. the first proposal on a shared D0) get separate cache entries.
+        sample = f"{args.domain}/{args.world}/seed={args.seed}"
         if provider == "anthropic":
             from mda.anthropic_client import AnthropicJSONClient
             client = AnthropicJSONClient(model=args.model or "claude-opus-4-7",
-                cache_dir=args.cache_dir, replay_only=args.replay)
+                cache_dir=args.cache_dir, replay_only=args.replay, sample=sample)
         else:
             from mda.openai_client import OpenAIJSONClient
             client = OpenAIJSONClient(model=args.model or "gpt-5.6-luna",
-                cache_dir=args.cache_dir, replay_only=args.replay)
+                cache_dir=args.cache_dir, replay_only=args.replay, sample=sample)
     if args.domain == "glucose":
         from .glucose import GlucoseBenchEnvironment, make_agent as make_glucose_agent, run_glucose
         environment = GlucoseBenchEnvironment(args.world, replicate=args.replicate)
