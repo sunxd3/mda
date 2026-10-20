@@ -243,7 +243,7 @@ A proposed symbolic law is screened at a few fixed prior draws and kept if any d
 
 Install `.[llm]`. Both clients stream requests, so any output budget is accepted.
 
-**Reasoning models.** `gpt-5.6-luna` does not accept `temperature`. The OpenAI client omits it for GPT-5-family and o-series reasoning models (`gpt-5*`, `o1*`, `o3*`, `o4*`), requests medium reasoning effort (configurable with `reasoning_effort`), and reserves at least 4096 output tokens, which also cover reasoning. The Anthropic client sends no temperature either: Opus 4.7 rejects sampling parameters.
+**Reasoning models.** `gpt-5.6-luna` does not accept `temperature`. The OpenAI client omits it for GPT-5-family and o-series reasoning models (`gpt-5*`, `o1*`, `o3*`, `o4*`), requests medium reasoning effort (configurable with `reasoning_effort`), and sends no output-token cap, because hidden reasoning shares that budget and a cap sized for the answer can truncate it; the model's own limit applies. Cache keys still record the former 4096-token floor, so responses cached by earlier versions replay unchanged. The Anthropic client sends no temperature either: Opus 4.7 rejects sampling parameters.
 
 **Caching.** With `cache_dir=".cache/mda-responses"`:
 
