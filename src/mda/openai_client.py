@@ -118,15 +118,22 @@ class OpenAIJSONClient:
             model=self.model,
             instructions=system,
             input=prompt,
-            max_output_tokens=max(max_tokens, 4096) if is_reasoning else max_tokens,
+            max_output_tokens=max_tokens,
             text={"format": output_format},
         )
+        cache_key = request
         # GPT-5-family and o-series reasoning models expose no sampling-temperature knob.
         if is_reasoning:
             request["reasoning"] = {"effort": self.reasoning_effort}
+            # Hidden reasoning shares the output budget, so a cap sized for the
+            # JSON answer truncates long reasoning and aborts the run. Send no
+            # cap; the model's own limit applies. The cache key keeps the
+            # former 4096 value so earlier cached responses still replay.
+            cache_key = {**request, "max_output_tokens": max(max_tokens, 4096)}
+            del request["max_output_tokens"]
         else:
             request["temperature"] = temperature
-        cache_path = self._cache_path(request)
+        cache_path = self._cache_path(cache_key)
         if cache_path is not None:
             cached = self._read_cache(cache_path)
             if cached is not None:

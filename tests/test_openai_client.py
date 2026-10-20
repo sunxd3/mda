@@ -122,7 +122,6 @@ def test_luna_default_request_and_cache_key_are_pinned(monkeypatch, tmp_path):
         "model": "gpt-5.6-luna",
         "instructions": "system",
         "input": "prompt",
-        "max_output_tokens": 4096,
         "text": {"format": {
             "type": "json_schema", "name": "answer", "strict": True,
             "schema": {"type": "object"},
@@ -148,7 +147,7 @@ def test_reasoning_model_family_detection(monkeypatch, model, reasoning):
     if reasoning:
         assert request["reasoning"] == {"effort": "medium"}
         assert "temperature" not in request
-        assert request["max_output_tokens"] == 4096
+        assert "max_output_tokens" not in request
     else:
         assert request["temperature"] == 0.2
         assert "reasoning" not in request
