@@ -180,3 +180,14 @@ def test_sample_label_separates_cache_entries_for_identical_requests(monkeypatch
     replay = OpenAIJSONClient(cache_dir=tmp_path, replay_only=True, sample="chemistry/w/seed=0")
     assert replay.ask_json("system", "prompt", schema={"type": "object"}) == {"seed": 0}
     assert len(calls) == 2
+
+
+def test_repeated_identical_request_is_a_fresh_draw_that_replays_in_order(monkeypatch, tmp_path):
+    calls = _install_openai_stub(monkeypatch, [_completed('{"draw": 0}'), _completed('{"draw": 1}')])
+    live = OpenAIJSONClient(api_key="stub", cache_dir=tmp_path, sample="chemistry/w/seed=0")
+    assert [live.ask_json("system", "prompt", schema={"type": "object"}) for _ in range(2)] == [
+        {"draw": 0}, {"draw": 1}]
+    replay = OpenAIJSONClient(cache_dir=tmp_path, replay_only=True, sample="chemistry/w/seed=0")
+    assert [replay.ask_json("system", "prompt", schema={"type": "object"}) for _ in range(2)] == [
+        {"draw": 0}, {"draw": 1}]
+    assert len(calls) == 2

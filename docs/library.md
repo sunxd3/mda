@@ -252,6 +252,8 @@ Install `.[llm]`. Both clients stream requests, so any output budget is accepted
 
 Pass `sample=` (any string) to either client to keep independent draws apart: clients with different labels never share an entry, even for identical requests. `mda-reproduce` labels each run with its domain, world, and seed, so seeds that start from the same D0 still get their own LLM proposals.
 
+Within one client, a repeat of an identical request is a new draw, as it would be without a cache: the *n*-th repeat is keyed with the label `<sample>/repeat=<n>`. Replay serves the draws in the same order.
+
 The cache key excludes credentials, but cached response text may still contain sensitive data. Keep the directory private and out of version control (it is in `.gitignore`). The default is no cache.
 
 **Replay.** `replay_only=True` serves only cached responses and fails on a miss before loading the SDK or checking credentials. This replays calls you captured; it does not reproduce the paper's unreleased responses.

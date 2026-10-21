@@ -115,7 +115,7 @@ def test_driver_records_pass_metrics_and_samples_random_designs(monkeypatch):
         build("boxing", "death", None, seed=0, smoke=True, budget=1, inference="smc")
 
 
-def test_proposer_uses_v5_prompt_and_drops_laws_outside_its_grammar(environment):
+def test_proposer_uses_v5_prompt_repairs_bounds_and_drops_laws_outside_its_grammar(environment):
     class Client:
         def ask_json(self, system, prompt, **kwargs):
             self.system, self.prompt = system, prompt
@@ -123,14 +123,17 @@ def test_proposer_uses_v5_prompt_and_drops_laws_outside_its_grammar(environment)
             return {"hypotheses": [
                 {"name": "mm", "expr": "k*Enz*C_A/(Km + C_A)", "params": positive},
                 {"name": "tanh", "expr": "k*Enz*tanh(C_A/Km)", "params": positive},
-                {"name": "offset", "expr": "k*C_A + c", "params": [positive[0], {"name": "c", "low": -1, "high": 1}]},
+                {"name": "offset", "expr": "k*CA + c", "params": [positive[0], {"name": "c", "low": 0, "high": 2}]},
+                {"name": "negative", "expr": "k*C_A + c", "params": [positive[0], {"name": "c", "low": -2, "high": -1}]},
             ]}
 
     client = Client()
     models = ChemBenchProposer(client).propose(
         context=environment.context + "\n\nCurrent phase: explore.", dataset=environment.initial_data,
         current_models=(), residuals=(), count=3)
-    assert [model.name for model in models] == ["mm"]
+    assert [model.name for model in models] == ["mm", "offset"]
+    assert models[1].structure == "k * C_A + c"
+    assert models[1].prior.lower.tolist() == [.01, 2e-6]
     assert client.system.startswith("You are an enzyme kineticist")
     assert "C_A=0.03, C_I=0, C_B=1, C_P=0, Enz=1, T=310, pH=7 -> r0=" in client.prompt
     assert "Current phase: explore." in client.prompt and "ALREADY TRIED" not in client.prompt

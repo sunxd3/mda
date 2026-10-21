@@ -18,6 +18,7 @@ exposed to the agent remain raw rates.
 from __future__ import annotations
 
 import ast
+import re
 import os
 import sys
 from collections.abc import Callable, Mapping, Sequence
@@ -88,6 +89,7 @@ _CHEM_WORLD = (
     "r0 = f(C_A,C_I,C_B,C_P,Enz,T,pH; theta) from the data."
 )
 _CHEM_FUNCTIONS = frozenset(("exp", "log", "sqrt"))
+_VARIABLE_ALIASES = {"CA": "C_A", "CB": "C_B", "CI": "C_I", "CP": "C_P", "E": "Enz", "Enzyme": "Enz"}
 
 
 class ChemBenchProposer(SymbolicRegressionProposer):
@@ -98,7 +100,17 @@ class ChemBenchProposer(SymbolicRegressionProposer):
     def __init__(self, client: Any) -> None:
         super().__init__(client, variable_names=VARIABLE_NAMES)
 
-    def check_hypothesis(self, expression: str, prior: UniformPrior) -> None:
+    def check_hypothesis(self, expression: str, prior: UniformPrior) -> tuple[str, UniformPrior]:
+        # The LLM often writes common variable spellings (CA, E) or a 0 lower
+        # bound (e.g. Ea in [0, 1e5]). Dropping such laws discarded most
+        # proposals in *_arrhenius worlds, so repair them instead: rename the
+        # spelling unless it is a declared parameter, and raise a 0 lower bound
+        # to 1e-6 of the upper one. v5 does not say how the paper handled this.
+        for alias, name in _VARIABLE_ALIASES.items():
+            if alias not in prior.names:
+                expression = re.sub(rf"(?<![\w.]){alias}(?!\w)", name, expression)
+        lower = np.where((prior.lower <= 0) & (prior.upper > 0), prior.upper * 1e-6, prior.lower)
+        prior = UniformPrior(prior.names, lower, prior.upper)
         for node in ast.walk(ast.parse(expression, mode="eval")):
             if isinstance(node, ast.Call) and node.func.id not in _CHEM_FUNCTIONS:
                 raise ValueError(f"{node.func.id} is outside the ChemBench grammar")
@@ -106,6 +118,7 @@ class ChemBenchProposer(SymbolicRegressionProposer):
                 raise ValueError("% is outside the ChemBench grammar")
         if np.any(prior.lower <= 0):
             raise ValueError("ChemBench parameter bounds must be positive")
+        return expression, prior
 
     def build_prompt(self, *, context, dataset, current_models, residuals, count) -> str:
         # The agent appends its budget/phase status to the world context.

@@ -39,6 +39,7 @@ class OpenAIJSONClient:
         self.reasoning_effort = reasoning_effort
         self.replay_only = replay_only
         self.sample = sample
+        self._request_counts: dict[str, int] = {}
         self.api_key = api_key
         self._client = None
         if not replay_only:
@@ -61,7 +62,13 @@ class OpenAIJSONClient:
             return None
         # ``sample`` labels an independent draw (e.g. a benchmark run seed):
         # runs that send identical requests must not share cached responses.
-        keyed = request if self.sample is None else {"request": request, "sample": self.sample}
+        # A repeat of an earlier identical request is a fresh draw, as it is
+        # without a cache, so it gets its own entry instead of the first reply.
+        base = json.dumps(request, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        repeat = self._request_counts.get(base, 0)
+        self._request_counts[base] = repeat + 1
+        sample = self.sample if repeat == 0 else f"{self.sample}/repeat={repeat}"
+        keyed = request if sample is None else {"request": request, "sample": sample}
         canonical = json.dumps(
             keyed, sort_keys=True, separators=(",", ":"), ensure_ascii=False
         ).encode("utf-8")
