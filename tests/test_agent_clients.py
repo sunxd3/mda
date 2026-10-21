@@ -61,8 +61,16 @@ def _stub_codex(monkeypatch, results):
             return False
 
         def thread_start(self, **started):
-            return Thread(started)
+            return Thread({**started, "launch": self.config})
 
+    catalog = {"models": [
+        {"slug": "gpt-5.6-luna", "tool_mode": "code_mode_only", "apply_patch_tool_type": "freeform",
+         "supports_search_tool": True, "multi_agent_version": "v1", "default_verbosity": "low"},
+        {"slug": "other", "tool_mode": "code_mode_only"},
+    ]}
+    monkeypatch.setitem(sys.modules, "codex_cli_bin", SimpleNamespace(bundled_codex_path=lambda: "codex"))
+    monkeypatch.setattr("mda.agent_clients.subprocess.run",
+                        lambda *a, **k: SimpleNamespace(stdout=json.dumps(catalog)))
     monkeypatch.setitem(sys.modules, "openai_codex", SimpleNamespace(
         ApprovalMode=SimpleNamespace(deny_all="deny_all"), Codex=Codex,
         CodexConfig=lambda **config: SimpleNamespace(**config),
@@ -94,6 +102,22 @@ def test_codex_runs_read_only_with_the_schema(monkeypatch):
     assert call["thread"]["sandbox"] == "read-only" and call["thread"]["approval_mode"] == "deny_all"
     assert call["thread"]["ephemeral"] is True
     assert call["turn"] == {"effort": "medium", "output_schema": SCHEMA}
+
+
+def test_codex_launches_with_its_own_context_and_tools_switched_off(monkeypatch):
+    calls = _stub_codex(monkeypatch, [_codex_result({"value": 3})])
+    client = CodexJSONClient()
+    client.ask_json("sys", "user", schema=SCHEMA)
+    overrides = calls[0]["thread"]["launch"].config_overrides
+    for setting in ("include_permissions_instructions=false", "include_environment_context=false",
+                    "skills.include_instructions=false", "features.shell_tool=false"):
+        assert setting in overrides
+    catalog_path = json.loads(overrides[0].removeprefix("model_catalog_json="))
+    luna, other = json.load(open(catalog_path))["models"]
+    assert luna == {"slug": "gpt-5.6-luna", "tool_mode": None, "apply_patch_tool_type": None,
+                    "supports_search_tool": False, "multi_agent_version": None,
+                    "default_verbosity": "medium"}
+    assert other["tool_mode"] == "code_mode_only"
 
 
 @pytest.mark.parametrize("make, stub, ok, module", [
