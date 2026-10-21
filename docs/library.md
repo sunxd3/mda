@@ -258,6 +258,21 @@ The cache key excludes credentials, but cached response text may still contain s
 
 **Replay.** `replay_only=True` serves only cached responses and fails on a miss before loading the SDK or checking credentials. This replays calls you captured; it does not reproduce the paper's unreleased responses.
 
+### Coding-agent clients
+
+`mda.agent_clients` runs each request as one tool-free turn of a coding agent, through its official Python SDK. Install `.[agents]`. Both clients have the same `ask_json` interface, `cache_dir`, `sample`, and `replay_only` behaviour as the API clients.
+
+| Client | Default model | Notes |
+|---|---|---|
+| `ClaudeCodeJSONClient(model="claude-opus-4-7", effort=None)` | Claude Opus 4.7 | `claude-agent-sdk` with JSON-schema output. Uses `ANTHROPIC_API_KEY` if set, otherwise the Claude subscription login or `CLAUDE_CODE_OAUTH_TOKEN`. `effort=None` keeps Claude Code's default |
+| `CodexJSONClient(model="gpt-5.6-luna", effort="medium")` | GPT-5.6 Luna | `openai-codex` with `output_schema`. Uses Codex's login (`codex login`, ChatGPT or API key) |
+
+Each call runs in an empty temporary directory with no tools, MCP servers, user settings, web search, or saved session. The system prompt replaces the agent's own. Neither agent exposes temperature or an output-token cap, so both are ignored.
+
+The agents still add their own framing, so these responses do not count as the paper's API configuration. Cache keys include the agent's name, so they never replay as API responses or as each other's. Claude Code returns its answer through an extra tool turn, so it costs more per call than the direct Anthropic client. Codex sends several thousand tokens of its own context with every call.
+
+Codex sets up its state directory (`CODEX_HOME`, default `~/.codex`) on its first run. Make one Codex call before you start parallel runs on a fresh home, because concurrent first runs can fail to set it up.
+
 ## Prediction
 
 - `agent.predict(action, flavour="map")`: the current-data MAP structure at its MAP parameters.

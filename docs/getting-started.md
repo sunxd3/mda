@@ -18,6 +18,7 @@ python -m venv .venv
 | Extra | Installs | Needed for |
 |---|---|---|
 | `llm` | `openai`, `anthropic` | LLM proposers and the ICL baseline |
+| `agents` | `claude-agent-sdk`, `openai-codex` | Claude Code and Codex as LLM providers |
 | `numpyro` | `numpyro`, `jax` | `NumPyroPrior` and generated NumPyro models (Boxing) |
 | `design` | `cma` | `CMAESOptimizer` continuous design (ChemBench) |
 | `bic` | `scipy` | `BICEvidence` |
@@ -79,7 +80,7 @@ RUN_LIVE_OPENAI=1 .venv/bin/pytest -q tests/test_openai_live.py
 .venv/bin/mda-neuron-baseline --world ca_rebound --budget 2 --model gpt-5.6-luna
 ```
 
-Anthropic runs need `ANTHROPIC_API_KEY`. Responses can be cached and replayed without credentials; see [LLM clients](library.md#llm-clients-caching-and-replay).
+Anthropic runs need `ANTHROPIC_API_KEY`. `--provider claude-code` and `--provider codex` use those agents' own logins instead; see [coding-agent clients](library.md#coding-agent-clients). Responses can be cached and replayed without credentials; see [LLM clients](library.md#llm-clients-caching-and-replay).
 
 ## Next steps
 

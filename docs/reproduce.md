@@ -54,7 +54,7 @@ Exactly one mode is required.
 | `--replay` | Cache only | Reads previously captured responses and fails on a cache miss without contacting a provider |
 | `--live` | Paid | Explicitly authorizes paid calls; responses are cached per domain, world, and seed |
 
-As in v5, the default provider is OpenAI `gpt-5.6-luna` at medium reasoning effort, except Boxing, whose appendix results use Anthropic `claude-opus-4-7` with reasoning off. v5 states no temperature and none is sent. Requests are streamed, so any output budget is accepted, and only a response that stopped at the forced tool call is cached. `--provider` and `--model` override these. No model availability or live score claim is made here.
+As in v5, the default provider is OpenAI `gpt-5.6-luna` at medium reasoning effort, except Boxing, whose appendix results use Anthropic `claude-opus-4-7` with reasoning off. v5 states no temperature and none is sent. Requests are streamed, so any output budget is accepted, and only a response that stopped at the forced tool call is cached. `--provider` and `--model` override these. `--provider claude-code` or `codex` sends the same prompts through those coding agents (install `.[agents]`); see [coding-agent clients](library.md#coding-agent-clients). No model availability or live score claim is made here.
 
 ## Settings and budgets
 
@@ -82,7 +82,7 @@ A finite-menu run whose budget exceeds the unused designs fails before it starts
 | `--no-m-open` | all | Disable expansion after the initial pool. For ChemBench also skips LLM initialization (v5's fixed nine-law control); for GlucoseBench also disables the initialization gate |
 | `--icl` | replay/live | Add the data-only ICL forecaster after every round (v5's "ICL (+MDA design)") |
 | `--recovery` | chemistry, physics, neuron | Structural recovery diagnostic (install `.[recovery]`) |
-| `--provider`, `--model`, `--cache-dir` | replay/live | Provider, model, and response cache (default `.cache/mda-responses`) |
+| `--provider`, `--model`, `--cache-dir` | replay/live | Provider (`openai`, `anthropic`, `claude-code`, `codex`), model, and response cache (default `.cache/mda-responses`) |
 | `--difficulty` | chemistry | Default `medium` (v5's setting) |
 | `--inference {bic,smc}` | chemistry | Profiled-BIC primary arm (default) or the SMC control |
 | `--cuts`, `--replicate` | glucose | Forecast cuts in minutes (0, 45, 120, 180; default 45) and replicate (default 0) |

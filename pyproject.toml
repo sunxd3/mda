@@ -15,6 +15,7 @@ dependencies = [
 
 [project.optional-dependencies]
 llm = ["openai>=1.100", "anthropic>=0.79"]
+agents = ["claude-agent-sdk>=0.2.170", "openai-codex>=0.163"]
 numpyro = ["numpyro>=0.19", "jax>=0.4.25"]
 physics = [
     "physchool @ git+https://github.com/SampsonML/DiscoverPhysics.git@33b7fa9df96de9c35744efd181ca7e5a8dd60ad5#subdirectory=PhysicsSchool",

@@ -13,4 +13,12 @@ echo "[setup] installing MDA, development tools, Luna client, and NeuronBench"
 echo "[setup] checking source imports"
 .venv/bin/python -m compileall -q src
 
+codex_home="${CODEX_HOME:-$HOME/.codex}"
+if [ -n "${CODEX_AUTH_JSON:-}" ] && [ ! -f "$codex_home/auth.json" ]; then
+  echo "[setup] restoring the Codex login from CODEX_AUTH_JSON"
+  mkdir -p "$codex_home"
+  chmod 700 "$codex_home"
+  (umask 077 && printf '%s' "$CODEX_AUTH_JSON" > "$codex_home/auth.json")
+fi
+
 echo "[setup] complete"
