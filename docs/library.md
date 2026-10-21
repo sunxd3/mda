@@ -269,7 +269,9 @@ The cache key excludes credentials, but cached response text may still contain s
 
 Each call runs in an empty temporary directory with no tools, MCP servers, user settings, web search, or saved session. The system prompt replaces the agent's own. Neither agent exposes temperature or an output-token cap, so both are ignored.
 
-The agents still add their own framing, so these responses do not count as the paper's API configuration. Cache keys include the agent's name, so they never replay as API responses or as each other's. Claude Code returns its answer through an extra tool turn, so it costs more per call than the direct Anthropic client. Codex sends several thousand tokens of its own context with every call.
+The responses do not count as the paper's API configuration. Cache keys include the agent's name, so they never replay as API responses or as each other's. Claude Code returns its answer through an extra tool turn, so it costs more per call than the direct Anthropic client.
+
+By default Codex adds about 8,000 tokens to every call: a JavaScript `exec` tool that wraps shell and patch tools, sub-agent tools, a skills list, sandbox and environment text (working directory, date, timezone), and low verbosity. The shell tool could read any file on disk, including a benchmark package's hidden parameters. `CodexJSONClient` switches all of this off at launch, with config overrides and a copy of Codex's model catalog whose entry for the model has no tool mode, patch tool, tool search, or sub-agents, and medium verbosity. A call then sends only the system prompt (as a developer message), the user prompt, and the output schema: a trivial prompt costs 58 input tokens instead of 7,962.
 
 Codex sets up its state directory (`CODEX_HOME`, default `~/.codex`) on its first run. Make one Codex call before you start parallel runs on a fresh home, because concurrent first runs can fail to set it up.
 
