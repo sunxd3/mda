@@ -193,8 +193,9 @@ def main():
     mode.add_argument("--smoke", action="store_true", help="reduced numerics; no LLM")
     mode.add_argument("--replay", action="store_true", help="cached provider calls only")
     mode.add_argument("--live", action="store_true", help="authorize paid provider calls")
-    parser.add_argument("--provider", choices=["anthropic", "openai"],
-                        help="default: anthropic (Opus 4.7) for Boxing, openai (GPT-5.6 Luna) otherwise")
+    parser.add_argument("--provider", choices=["anthropic", "openai", "claude-code", "codex"],
+                        help="default: anthropic (Opus 4.7) for Boxing, openai (GPT-5.6 Luna) otherwise; "
+                             "claude-code and codex run those coding agents through their SDKs")
     parser.add_argument("--inference", choices=["bic", "smc"],
                         help="ChemBench arm: profiled-BIC primary (default) or the SMC control")
     parser.add_argument("--model")
@@ -271,6 +272,14 @@ def main():
             from mda.anthropic_client import AnthropicJSONClient
             client = AnthropicJSONClient(model=args.model or "claude-opus-4-7",
                 cache_dir=args.cache_dir, replay_only=args.replay, sample=sample)
+        elif provider == "claude-code":
+            from mda.agent_clients import ClaudeCodeJSONClient
+            client = ClaudeCodeJSONClient(model=args.model or "claude-opus-4-7",
+                cache_dir=args.cache_dir, replay_only=args.replay, sample=sample)
+        elif provider == "codex":
+            from mda.agent_clients import CodexJSONClient
+            client = CodexJSONClient(model=args.model or "gpt-5.6-luna",
+                cache_dir=args.cache_dir, replay_only=args.replay, sample=sample)
         else:
             from mda.openai_client import OpenAIJSONClient
             client = OpenAIJSONClient(model=args.model or "gpt-5.6-luna",
@@ -318,7 +327,7 @@ def _write_result(args, result, client):
     result["model"] = None if client is None else client.model
     result["versions"] = {}
     for package in ("model-discovery-agent", "numpy", "scipy", "numpyro", "jax", "neuronbench",
-                    "glucosebench", "anthropic", "openai"):
+                    "glucosebench", "anthropic", "openai", "claude-agent-sdk", "openai-codex"):
         try:
             result["versions"][package] = importlib.metadata.version(package)
         except importlib.metadata.PackageNotFoundError:
