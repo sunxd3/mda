@@ -236,7 +236,7 @@ class SymbolicRegressionProposer:
     """Paper-style JSON proposer for algebraic scalar models.
 
     Subclasses can replace ``system`` and ``build_prompt`` for a domain prompt,
-    and ``check_hypothesis`` to reject laws outside a domain grammar.
+    and ``check_hypothesis`` to repair or reject laws outside a domain grammar.
     """
 
     system = "You are a scientific model-discovery assistant. Reply with JSON only."
@@ -250,8 +250,9 @@ class SymbolicRegressionProposer:
         self.client = client
         self.variable_names = tuple(variable_names)
 
-    def check_hypothesis(self, expression: str, prior: UniformPrior) -> None:
-        """Raise ``ValueError`` to drop a proposal; any whitelisted law is accepted here."""
+    def check_hypothesis(self, expression: str, prior: UniformPrior) -> tuple[str, UniformPrior]:
+        """Return the law, possibly repaired, or raise ``ValueError`` to drop it."""
+        return expression, prior
 
     def input_residual_correlations(
         self, dataset: Sequence[Datum], residuals: Sequence[dict[str, Any]],
@@ -418,7 +419,8 @@ scientifically plausible uniform-prior bounds. Return JSON only."""
                     np.asarray([parameter["high"] for parameter in item["params"]]),
                 )
                 expression = canonical_expression(item["expr"])
-                self.check_hypothesis(expression, prior)
+                expression, prior = self.check_hypothesis(expression, prior)
+                names = prior.names
                 if expression in existing:
                     continue
                 predict = compile_expression(expression, self.variable_names, names)

@@ -49,7 +49,7 @@ v5's universe is exactly the pinned registry's 57 standard worlds (`chemistry.be
 | Prediction | MAP |
 | SMC control (`--inference smc`) | Tempered SMC with 100 particles, three rejuvenation moves, ESS target 0.6, and a 2-nat-per-parameter prior |
 
-The LLM proposer is `ChemBenchProposer`, which sends v5's published ChemBench prompt (`prompts/chem_proposer.txt` in the arXiv source): the enzyme-kinetics framing with input units, the experiments, and, when refining, the forms already tried with their median residuals and the inputs the best form's residual correlates with. It drops laws that use functions other than exp, log, and sqrt, or `%`, and laws with a non-positive parameter bound. Smoke mode uses 20 CMA-ES evaluations, two BIC starts, and 12 queries.
+The LLM proposer is `ChemBenchProposer`, which sends v5's published ChemBench prompt (`prompts/chem_proposer.txt` in the arXiv source): the enzyme-kinetics framing with input units, the experiments, and, when refining, the forms already tried with their median residuals and the inputs the best form's residual correlates with. It drops laws that use functions other than exp, log, and sqrt, or `%`. It repairs two common slips instead of dropping the law: a variable spelled `CA`, `CB`, `CI`, `CP`, `E`, or `Enzyme` (when that name is not a declared parameter) is renamed, and a lower bound of 0 or below is raised to 10⁻⁶ of a positive upper bound. Laws with a non-positive upper bound are still dropped. Smoke mode uses 20 CMA-ES evaluations, two BIC starts, and 12 queries.
 
 ## Differences from the paper
 
@@ -64,5 +64,6 @@ The LLM proposer is `ChemBenchProposer`, which sends v5's published ChemBench pr
 - A law that cannot be evaluated over the queries is recorded as a failure (`evaluable: false`, `passed: false`).
 - Held-out references are the clean primary law, as in upstream `evaluate_law`. The upstream oracle's noise is input-hashed, not a new independent draw for each run seed.
 - When a model interpolates the data (for example a three-parameter law on the three-point D0), profiled BIC floors its RSS at the smallest positive float, so it takes essentially all the weight until more data arrive. The other models stay in the pool with zero weight and recover once the fit is no longer exact. v5 does not say how it handles an exact fit.
+- v5 does not say how it handles a proposed bound of 0 (common for activation energies). Repairing it is a local choice; dropping such laws instead discarded most expansion proposals in the `*_arrhenius` worlds.
 - ICL (+LLM design) and the SciLab/PySR baseline are not implemented.
 - `--recovery` adds v4's constant-refit structural recovery; see [Reproducing the paper](../reproduce.md#structural-recovery-v4-diagnostic).
