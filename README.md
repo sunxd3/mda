@@ -88,12 +88,12 @@ ChemBench and ForceBench need extra source checkouts. See [Reproducing the paper
 | [Library guide](docs/library.md) | Building agents: models, priors, likelihoods, evidence, design, proposers, LLM clients, configuration |
 | [Reproducing the paper](docs/reproduce.md) | The `mda-reproduce` driver: modes, flags, output, and safety |
 | Benchmarks | [ChemBench](docs/benchmarks/chembench.md) · [GlucoseBench](docs/benchmarks/glucosebench.md) · [NeuronBench](docs/benchmarks/neuronbench.md) · [BoxingGym](docs/benchmarks/boxing.md) · [ForceBench (v4)](docs/benchmarks/forcebench.md) |
-| [ChemBench replication](docs/replication.md) | Full ChemBench sweep against the paper: results, the bugs that closed the gap, what still fails |
+| [Replication](docs/replication.md) | Full ChemBench and GlucoseBench sweeps against the paper: results, protocol, the bugs that closed the gap, limits |
 | [Paper fidelity](docs/paper-fidelity.md) | Algorithm-to-code map, v5 changes, corrections, open choices, and what still differs from the paper |
 
 ## Status
 
-This is an independent reimplementation, not the authors' code. A full ChemBench sweep (171 cells, live GPT-5.6 Luna calls) passes 78.9% at 25 observations, against the paper's 78.4%; see [ChemBench replication](docs/replication.md). The other benchmarks have not been swept, and the paper's per-call LLM responses are not public, so its exact runs cannot be replayed. [Paper fidelity](docs/paper-fidelity.md#what-still-prevents-an-exact-paper-reproduction) lists every known difference.
+This is an independent reimplementation, not the authors' code. A full ChemBench sweep (171 cells, live GPT-5.6 Luna calls) passes 78.9% at 25 observations, against the paper's 78.4%, and a 30-patient GlucoseBench sweep reaches CGM nMSE 0.25 after six episodes, against the paper's 0.316; see [Replication](docs/replication.md). NeuronBench and BoxingGym have not been swept, and the paper's per-call LLM responses are not public, so its exact runs cannot be replayed. [Paper fidelity](docs/paper-fidelity.md#what-still-prevents-an-exact-paper-reproduction) lists every known difference.
 
 ## License
 
