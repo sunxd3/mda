@@ -117,7 +117,7 @@ v5 restructured the paper: its main domains are now ChemBench, the new GlucoseBe
 ## What still prevents an exact paper reproduction
 
 - **No released responses.** The paper's per-call LLM responses, selected histories, and configuration files are not public, so its scores cannot be replayed. Caching enables replay of calls captured here, not of the paper's.
-- **Unexecuted runs.** Large benchmark runs, paid proposal calls, statistical score matching, and full comparison plots have not been executed. No live score claim is made.
+- **Unexecuted runs.** Only ChemBench has been swept with live LLM calls; it matches the paper's pass rate ([ChemBench replication](replication.md)). The other benchmarks have no live sweep or score claim.
 - **ChemBench.** A different query set for the pass rate and nMSLE, raw-rate check residuals, and linear `C_I`/`C_P` axes, among others. ICL (+LLM design) and the SciLab/PySR baseline are not implemented. See [ChemBench](benchmarks/chembench.md#differences-from-the-paper).
 - **GlucoseBench.** The ARX, VARX, and SINDYc baselines and ICL (+LLM design) are not implemented; failed cells are counted rather than restricted to v5's valid subset. See [GlucoseBench](benchmarks/glucosebench.md#not-implemented).
 - **NeuronBench.** v5's 90-protocol, 20-sample, 24-query harness is not in the pinned release, the channel parameterization differs, and v5's other inference arms are not wired into the runner. See [NeuronBench](benchmarks/neuronbench.md#differences-from-v5).

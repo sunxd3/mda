@@ -88,11 +88,12 @@ ChemBench and ForceBench need extra source checkouts. See [Reproducing the paper
 | [Library guide](docs/library.md) | Building agents: models, priors, likelihoods, evidence, design, proposers, LLM clients, configuration |
 | [Reproducing the paper](docs/reproduce.md) | The `mda-reproduce` driver: modes, flags, output, and safety |
 | Benchmarks | [ChemBench](docs/benchmarks/chembench.md) · [GlucoseBench](docs/benchmarks/glucosebench.md) · [NeuronBench](docs/benchmarks/neuronbench.md) · [BoxingGym](docs/benchmarks/boxing.md) · [ForceBench (v4)](docs/benchmarks/forcebench.md) |
+| [ChemBench replication](docs/replication.md) | Full ChemBench sweep against the paper: results, the bugs that closed the gap, what still fails |
 | [Paper fidelity](docs/paper-fidelity.md) | Algorithm-to-code map, v5 changes, corrections, open choices, and what still differs from the paper |
 
 ## Status
 
-This is an independent reimplementation, not the authors' code. The algorithms are implemented and tested, but the paper's scores have not been reproduced: its per-call LLM responses and several evaluation harnesses are not public, and no large benchmark sweeps or paid runs have been executed here. [Paper fidelity](docs/paper-fidelity.md#what-still-prevents-an-exact-paper-reproduction) lists every known difference.
+This is an independent reimplementation, not the authors' code. A full ChemBench sweep (171 cells, live GPT-5.6 Luna calls) passes 78.9% at 25 observations, against the paper's 78.4%; see [ChemBench replication](docs/replication.md). The other benchmarks have not been swept, and the paper's per-call LLM responses are not public, so its exact runs cannot be replayed. [Paper fidelity](docs/paper-fidelity.md#what-still-prevents-an-exact-paper-reproduction) lists every known difference.
 
 ## License
 
