@@ -61,6 +61,7 @@ class AgentConfig:
     programs_per_proposal: int = 2
     program_proposal_cap: int = 4
     program_draws: int = 128
+    program_inner_particles: int = 512
 
     def __post_init__(self) -> None:
         if self.model_cap < 1 or self.new_models_per_expansion < 1:
@@ -71,7 +72,8 @@ class AgentConfig:
             raise ValueError("error threshold and Occam penalty cannot be negative")
         if self.design_flavour not in {"model", "joint", "task", "task_full_observation", "program"}:
             raise ValueError("unknown design_flavour")
-        if min(self.program_cap, self.programs_per_proposal, self.program_draws) < 1 or self.program_proposal_cap < 0:
+        if min(self.program_cap, self.programs_per_proposal, self.program_draws,
+               self.program_inner_particles) < 1 or self.program_proposal_cap < 0:
             raise ValueError("program pool sizes and draws must be positive")
         if self.minimum_model_cap is not None and not 1 <= self.minimum_model_cap <= self.model_cap:
             raise ValueError("minimum_model_cap must be between 1 and model_cap")
@@ -312,7 +314,8 @@ class ModelDiscoveryAgent:
             try:
                 return trajectory_information(
                     program, self.belief, self.likelihood, episode,
-                    draws=self.config.program_draws, seed=seed, summary=summary,
+                    draws=self.config.program_draws, inner=self.config.program_inner_particles,
+                    seed=seed, summary=summary,
                 )
             except (ProgramError, ValueError, ArithmeticError):
                 return None

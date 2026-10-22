@@ -76,14 +76,15 @@ Neither objective is exact information gain for a general non-Gaussian mixture.
 
 ## Experiment programs (beyond v5)
 
-v5 designs one action at a time. `design_flavour="program"` instead designs a whole episode whose inputs adapt to the observations within it. An LLM writes the programs (`ProgramProposer`), but they are scored numerically. The score is a nested-Monte-Carlo estimate of I(M; Y₁:T | D, program), with closed-loop simulation against belief particles and mda's own likelihood as the inner term. See [Library: experiment programs](library.md#experiment-programs-beyond-v5). The idea is from `expprog` (sunxd3/model-agent); the estimator, with common random numbers and self-exclusion by value, is from an earlier exploratory study.
+v5 designs one action at a time. `design_flavour="program"` instead designs a whole episode whose inputs adapt to the observations within it. An LLM writes the programs (`ProgramProposer`), but they are scored numerically. The score is a nested-Monte-Carlo estimate of I(M; Y₁:T | D, program), with closed-loop simulation against a kernel-smoothed version of the particle belief and mda's own likelihood as the inner term. See [Library: experiment programs](library.md#experiment-programs-beyond-v5). The idea is from `expprog` (sunxd3/model-agent).
 
 The completed episode is stored as `Datum(realised_inputs, trajectory)`, so the model side of Algorithm 2 is untouched. The trajectory likelihood is ignorable for a deterministic program, or a program whose randomness does not depend on the model: the inputs carry no information about the model beyond the observations they were chosen from. The predictive check still compares the trajectory with each model's mean trajectory at the realised inputs. That is valid without per-episode latent variables, which this extension does not support.
 
 Known limits:
 
-- Self-exclusion leaves each model's inner sum with one fewer value than the others. With few distinct particles and a sharp likelihood, this biases the estimate downward. In `mda.benchmarks.episodic`, two indistinguishable models scored −1.8 bits with 40 SMC particles each, and −0.03 bits with 200.
-- The inner term calls the generic likelihood once per imagined episode and distinct particle. This dominates the cost: about 6 s per program for 300 particles × 2 models × 200 draws.
+- The estimand is the information under the *smoothed* belief, which is wider than the particle belief by a Silverman-rule bandwidth. Smoothing is truncated to the prior's support but does not reweight by the likelihood, so it can put mass where the data rule a model out.
+- Outer and inner draws are independent, so, in expectation, the estimate is a Barber–Agakov lower bound. The defensive weight ε = 10⁻³ (the inner model posterior mixed with the model weights) caps the loss from an episode that no inner draw explains at log₂(1/ε) ≈ 10 bits. The remaining gap shrinks as `program_inner_particles` grows. In `mda.benchmarks.episodic`, two indistinguishable models score between −0.03 and +0.01 bits (SD up to 0.07, over 10 scorer seeds) at 40, 100 and 200 SMC particles per model. Narrow likelihoods in higher-dimensional parameter spaces need more inner draws.
+- An earlier version used the SMC particles themselves as the inner set and excluded the outer particle by value. With sparse particles, that left no own-model value explaining a sharp trajectory, and single draws scored hundreds of negative bits.
 
 ## Pseudocode corrections
 

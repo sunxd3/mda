@@ -106,7 +106,6 @@ def _particle_belief(models, thetas, copies=1):
     return BeliefState(tuple(fits), np.full(len(models), 1.0 / len(models)))
 
 
-@pytest.mark.slow
 def test_scorer_is_zero_for_indistinguishable_models_and_bounded_otherwise():
     thetas = np.random.default_rng(0).uniform(0.2, 0.8, 300)
     bracket = episodic.seed_programs()[1]
@@ -128,6 +127,27 @@ def test_scorer_is_zero_for_indistinguishable_models_and_bounded_otherwise():
     assert abs(below.bits) < 0.05
 
 
+def test_scorer_ranking_and_zero_survive_sparse_smc_particles():
+    # 40 SMC particles per model: with the SMC particles as the inner set, the
+    # bracketing program scored below the fixed spread and twins scored
+    # strongly negative, because single episodes cost hundreds of bits.
+    twin = replace(episodic.make_model("rise", 1.0), structure="twin")
+    beliefs = {
+        "distinct": _agent().belief,
+        "twins": _agent(initial_models=[episodic.make_model("rise", 1.0), twin]).belief,
+    }
+    programs = {"spread": FixedProgram(np.linspace(0.25, 0.85, 5)), "bracket": episodic.seed_programs()[1],
+                "narrow": FixedProgram([0.5, 0.52, 0.55, 0.58, 0.6])}
+    for seed in range(3):
+        bits = {name: trajectory_information(program, beliefs["distinct"], LIKELIHOOD, episodic.EPISODE,
+                                             draws=128, seed=seed).bits
+                for name, program in programs.items()}
+        assert bits["bracket"] >= bits["spread"] > bits["narrow"] > 0.2
+        twins = trajectory_information(programs["bracket"], beliefs["twins"], LIKELIHOOD,
+                                       episodic.EPISODE, draws=128, seed=seed).bits
+        assert abs(twins) < 0.1
+
+
 def test_scorer_uses_common_random_numbers_and_ignores_duplicate_particles():
     thetas = np.random.default_rng(1).uniform(0.2, 0.8, 30)
     bracket = episodic.seed_programs()[1]
@@ -136,8 +156,8 @@ def test_scorer_uses_common_random_numbers_and_ignores_duplicate_particles():
     score = lambda belief, seed: trajectory_information(  # noqa: E731
         bracket, belief, LIKELIHOOD, episodic.EPISODE, draws=100, seed=seed).bits
     assert score(single, 5) == score(single, 5)
-    # Self-exclusion is by value: SMC copies of the outer particle never stay
-    # in its own inner sum, so duplicating every particle changes nothing.
+    # The smoothed belief depends on particle values and weights only, so SMC
+    # copies of a particle change nothing.
     assert score(tripled, 5) == score(single, 5)
 
 

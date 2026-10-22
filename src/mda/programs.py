@@ -9,17 +9,26 @@ action is the special case ``FixedProgram(inputs)``.
 
 Programs are scored by the information the whole trajectory carries about the
 model index, estimated by nested Monte Carlo with each imagined episode run
-closed loop against one belief particle::
+closed loop against one draw from the belief::
 
     J(pi) = I(M; Y_1:T | D, pi)
-          ~ mean_i [ log p(y_i | m_i) - log sum_m w_m p(y_i | m) ] / log 2,
-    p(y_i | m) = sum_{j in m, j != i} w_j p(y_i | theta_j) / sum_{j in m, j != i} w_j,
+          ~ mean_i [ log q(m_i | y_i) - log w_{m_i} ] / log 2,
+    q(m | y) = (1 - e) p^(m | y) + e w_m,   p^(m | y) ∝ w_m (1/J) sum_j p(y | theta_mj),
 
-where ``p(y_i | theta_j)`` is mda's own likelihood of the datum
-``(u_i, y_i)``. The estimator is ported from the program-design study: common
-random numbers (one seed per decision, shared by every candidate) and
-self-exclusion by *value*, so SMC duplicates of the outer particle do not
-inflate ``p(y_i | m_i)``. A hypothesis with a single distinct value keeps it.
+where ``p(y | theta)`` is mda's own likelihood of the datum ``(u, y)``. The
+belief is each model's particles smoothed by a shrinkage kernel
+(``smoothed_draws``). The outer ``(m_i, theta_i)`` and each model's ``J``
+inner values are independent draws from it, so ``q`` does not depend on the
+outer draw and the estimate is, in expectation, a Barber-Agakov lower bound on
+the information under the smoothed belief. The defensive weight ``e = 1e-3``
+caps the loss from an episode that no inner value explains at ``log2(1/e)``
+bits. Every candidate in one decision shares one seed (common random numbers).
+
+This replaces the earlier self-exclusion estimator, whose inner sets were the
+SMC particles minus the outer one. With sparse particles, a sharp likelihood
+then often left no own-model value explaining the episode, and the per-draw
+term became an unbounded comparison of two models' mismatches (hundreds of
+negative bits at 40 particles per model in ``mda.benchmarks.episodic``).
 """
 
 from __future__ import annotations
@@ -32,6 +41,7 @@ from typing import Any, Protocol
 
 import numpy as np
 
+from .likelihoods import DeterministicGaussianLikelihood
 from .posterior import BeliefState
 from .types import CandidateModel, Datum, PredictFn, StepSampler
 
@@ -287,6 +297,86 @@ def _row_logsumexp(values: np.ndarray) -> np.ndarray:
         return safe[:, 0] + np.log(np.exp(values - safe).sum(axis=1))
 
 
+def smoothed_draws(model: CandidateModel, thetas: np.ndarray, weights: np.ndarray, count: int,
+                   rng: np.random.Generator) -> np.ndarray:
+    """``count`` draws from a kernel-smoothed version of one model's particle posterior.
+
+    Liu-West shrinkage kernel: a parent ``theta_j`` drawn by weight moves to
+    ``a theta_j + (1 - a) mean + h L eps`` with ``a = sqrt(1 - h^2)``, so the
+    smoothed belief keeps the particles' mean and covariance ``L L^T``.
+    ``h`` is Silverman's rule for the effective particle count. Draws outside
+    the prior's support are redrawn, and after 50 tries fall back to their parent.
+    """
+    thetas = np.asarray(thetas, dtype=float).reshape(len(weights), -1)
+    weights = np.asarray(weights, dtype=float) / np.sum(weights)
+    parents = rng.choice(len(weights), size=count, p=weights)
+    dimension = thetas.shape[1]
+    if dimension == 0 or len(weights) == 1:
+        return thetas[parents].copy()
+    mean = weights @ thetas
+    centred = thetas - mean
+    values, vectors = np.linalg.eigh((centred * weights[:, None]).T @ centred)
+    root = vectors * np.sqrt(np.clip(values, 0.0, None))
+    effective = 1.0 / float(np.sum(weights**2))
+    h = min(1.0, (4.0 / ((dimension + 2) * effective)) ** (1.0 / (dimension + 4)))
+    centres = np.sqrt(1.0 - h * h) * thetas[parents] + (1.0 - np.sqrt(1.0 - h * h)) * mean
+    draws = centres + h * rng.standard_normal((count, dimension)) @ root.T
+    bad = np.arange(count)
+    for _ in range(50):
+        bad = bad[[not np.isfinite(model.prior.logpdf(draws[i])) for i in bad]]
+        if bad.size == 0:
+            break
+        draws[bad] = centres[bad] + h * rng.standard_normal((bad.size, dimension)) @ root.T
+    else:
+        bad = bad[[not np.isfinite(model.prior.logpdf(draws[i])) for i in bad]]
+        draws[bad] = thetas[parents[bad]]
+    return draws
+
+
+def _log_likelihoods(likelihood, model: CandidateModel, thetas: np.ndarray, inputs: np.ndarray,
+                     observations: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    """``(draws, len(thetas))`` log-likelihoods of the episodes ``(inputs[i], observations[i])``.
+
+    For ``DeterministicGaussianLikelihood`` with a fixed SD this is the same
+    density, vectorised: each model mean is computed once per distinct input
+    row and parameter value. Any other likelihood is called once per pair.
+    """
+    draws, steps = observations.shape
+    out = np.full((draws, len(thetas)), -np.inf)
+    std = getattr(likelihood, "observation_std", None)
+    if isinstance(likelihood, DeterministicGaussianLikelihood) and not callable(std):
+        std = np.broadcast_to(np.asarray(std, dtype=float), (steps,))
+        if np.any(~np.isfinite(std)) or np.any(std <= 0):
+            return out
+        rows: dict[bytes, list[int]] = {}
+        for i in range(draws):
+            rows.setdefault(inputs[i].tobytes(), []).append(i)
+        constant = float(np.sum(np.log(std)) + 0.5 * steps * np.log(2 * np.pi))
+        for members in rows.values():
+            means = np.full((len(thetas), steps), np.nan)
+            for j, theta in enumerate(thetas):
+                try:
+                    mean = model.observation_prediction(theta, inputs[members[0]])
+                except (ValueError, ArithmeticError):
+                    continue
+                if mean.shape == (steps,):
+                    means[j] = mean
+            residual = (observations[members][:, None, :] - means[None, :, :]) / std
+            values = -0.5 * np.sum(residual * residual, axis=2) - constant
+            out[members] = np.where(np.isfinite(values), values, -np.inf)
+        return out
+    for i in range(draws):
+        datum = [Datum(inputs[i], observations[i])]
+        for j, theta in enumerate(thetas):
+            try:
+                value = float(likelihood(datum, model, theta, rng))
+            except (ValueError, ArithmeticError):
+                continue
+            if np.isfinite(value):
+                out[i, j] = value
+    return out
+
+
 @dataclass(frozen=True)
 class ProgramScore:
     """A trajectory-information estimate and the imagined episodes behind it."""
@@ -298,6 +388,13 @@ class ProgramScore:
     hypothesis: np.ndarray
 
 
+# Defensive mixing of the inner model posterior with the model weights
+# (Barber-Agakov bound with q = (1 - e) p(m | y) + e w_m): an imagined episode
+# that no inner value of its own model explains costs at most log2(1/e) bits
+# instead of an unbounded amount. For well-explained episodes the change is O(e).
+_DEFENSIVE = 1e-3
+
+
 def trajectory_information(
     program: Program,
     belief: BeliefState,
@@ -306,35 +403,56 @@ def trajectory_information(
     *,
     draws: int,
     seed: int,
+    inner: int = 512,
     summary: Mapping[str, Any] | None = None,
 ) -> ProgramScore:
     """Nested-MC ``I(M; Y_1:T | D, program)`` in bits (see the module docstring).
 
-    The same ``seed`` gives every candidate the same outer particles, step
-    noise streams (one generator per outer draw) and likelihood generator.
-    Every weighted model must have ``sample_step``. Raises ``ProgramError`` if
-    the program fails and ``ValueError`` if a model cannot simulate an input.
+    Each model's particles are first smoothed (``smoothed_draws``). Outer
+    ``(m, theta)`` are drawn from the smoothed belief, and each model's inner
+    set is ``inner`` further draws, independent of the outer ones, so no
+    self-exclusion is needed and the inner resolution does not depend on the
+    SMC particle count. The same ``seed`` gives every candidate the same outer
+    draws, inner sets, step noise streams (one generator per outer draw) and
+    likelihood generator. Every weighted model must have ``sample_step``.
+    Raises ``ProgramError`` if the program fails and ``ValueError`` if a model
+    cannot simulate an input.
     """
-    if draws < 1:
-        raise ValueError("draws must be positive")
+    if draws < 1 or inner < 1:
+        raise ValueError("draws and inner must be positive")
     particles = _Particles.from_belief(belief)
     missing = [model.name for model in particles.models if model.sample_step is None]
     if missing:
         raise ValueError(f"program design needs sample_step on every weighted model: {missing}")
     summary = belief_summary(belief) if summary is None else summary
-    streams = np.random.SeedSequence(seed).spawn(draws + 2)
-    outer = np.random.default_rng(streams[0]).choice(particles.weight.size, size=draws, p=particles.weight)
-    likelihood_rng = np.random.default_rng(streams[1])
-    step_rngs = [np.random.default_rng(stream) for stream in streams[2:]]
+    streams = np.random.SeedSequence(seed).spawn(draws + 3)
+    outer_rng, inner_rng = np.random.default_rng(streams[0]), np.random.default_rng(streams[1])
+    likelihood_rng = np.random.default_rng(streams[2])
+    step_rngs = [np.random.default_rng(stream) for stream in streams[3:]]
+    hypotheses = len(particles.models)
+    members = [np.flatnonzero(particles.hypothesis == h) for h in range(hypotheses)]
+
+    def draw(h, count, rng):
+        values = np.stack([particles.thetas[j] for j in members[h]])
+        return smoothed_draws(particles.models[h], values, particles.weight[members[h]], count, rng)
+
+    outer_model = outer_rng.choice(hypotheses, size=draws, p=particles.model_weights)
+    outer_theta: list[np.ndarray] = [None] * draws
+    for h in range(hypotheses):
+        rows = np.flatnonzero(outer_model == h)
+        if rows.size:
+            for row, theta in zip(rows, draw(h, rows.size, outer_rng), strict=True):
+                outer_theta[row] = theta
+    inner_thetas = [draw(h, inner, inner_rng) for h in range(hypotheses)]
 
     histories = [History(horizon=episode.steps) for _ in range(draws)]
     with program.session() as step:
         for _ in range(episode.steps):
             values = _next_inputs(step, histories, summary, episode)
-            for history, value, particle, rng in zip(histories, values, outer, step_rngs, strict=True):
+            for i, (history, value, rng) in enumerate(zip(histories, values, step_rngs, strict=True)):
                 history.inputs.append(float(value))
-                model = particles.models[particles.hypothesis[particle]]
-                y = float(model.sample_step(particles.thetas[particle], np.asarray(history.inputs),
+                model = particles.models[outer_model[i]]
+                y = float(model.sample_step(outer_theta[i], np.asarray(history.inputs),
                                             np.asarray(history.obs), rng))
                 if not np.isfinite(y):
                     raise ValueError(f"model {model.name!r} simulated a non-finite observation")
@@ -342,32 +460,22 @@ def trajectory_information(
     inputs = np.asarray([history.inputs for history in histories])
     observations = np.asarray([history.obs for history in histories])
 
-    log_likelihood = np.full((draws, particles.weight.size), -np.inf)
-    for value, theta in enumerate(particles.thetas):
-        model = particles.models[particles.hypothesis[value]]
-        for i in range(draws):
-            try:
-                log_likelihood[i, value] = float(
-                    likelihood([Datum(inputs[i], observations[i])], model, theta, likelihood_rng)
-                )
-            except (ValueError, ArithmeticError):
-                pass
-    log_likelihood[~np.isfinite(log_likelihood)] = -np.inf
-
-    log_weight = np.log(particles.weight)
-    log_p = np.full((draws, len(particles.models)), -np.inf)
-    for h in range(len(particles.models)):
-        members = np.flatnonzero(particles.hypothesis == h)
-        keep = members[None, :] != outer[:, None]
-        keep[~keep.any(axis=1)] = True
-        member_log_weight = np.where(keep, log_weight[members][None, :], -np.inf)
-        log_p[:, h] = (_row_logsumexp(log_likelihood[:, members] + member_log_weight)
-                       - _row_logsumexp(member_log_weight))
-    own = log_p[np.arange(draws), particles.hypothesis[outer]]
-    mixture = _row_logsumexp(log_p + np.log(particles.model_weights)[None, :])
-    good = np.isfinite(own) & np.isfinite(mixture)
-    bits = float(np.mean(own[good] - mixture[good]) / LOG2) if good.any() else 0.0
-    return ProgramScore(bits, inputs, observations, particles.models, particles.hypothesis[outer])
+    log_p = np.column_stack([
+        _row_logsumexp(_log_likelihoods(likelihood, particles.models[h], inner_thetas[h],
+                                        inputs, observations, likelihood_rng)) - np.log(inner)
+        for h in range(hypotheses)
+    ])
+    log_prior = np.log(particles.model_weights)
+    joint = log_p + log_prior[None, :]
+    normaliser = _row_logsumexp(joint)
+    rows = np.arange(draws)
+    with np.errstate(invalid="ignore"):
+        posterior = np.exp(joint[rows, outer_model] - normaliser)
+    # No inner value of any model explains the episode: nothing is learnt.
+    posterior = np.where(np.isfinite(normaliser), posterior, particles.model_weights[outer_model])
+    own = np.log((1 - _DEFENSIVE) * posterior + _DEFENSIVE * particles.model_weights[outer_model])
+    bits = float(np.mean(own - log_prior[outer_model]) / LOG2)
+    return ProgramScore(bits, inputs, observations, particles.models, outer_model)
 
 
 # --------------------------------------------------------------------------- proposer context
