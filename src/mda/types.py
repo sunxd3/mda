@@ -10,6 +10,9 @@ import numpy as np
 
 Array = np.ndarray
 PredictFn = Callable[[Array, Any], Array]
+# (theta, inputs[:t+1], observations[:t], rng) -> y[t]: one draw of the next
+# observation of an episode given its inputs so far, the last one new.
+StepSampler = Callable[[Array, Array, Array, np.random.Generator], float]
 
 
 class NonFinitePrediction(ValueError):
@@ -104,7 +107,13 @@ class StateSpaceModel:
 
 @dataclass(frozen=True, eq=False)
 class CandidateModel:
-    """One model-structure particle and its parameter prior."""
+    """One model-structure particle and its parameter prior.
+
+    ``sample_step`` is needed only for program design (``mda.programs``): it
+    draws the next observation of an episode under this model, which the
+    closed-loop simulator needs and ``predict`` (a whole-action mean) cannot
+    supply in general. ``gaussian_step`` builds it for deterministic models.
+    """
 
     name: str
     prior: Prior
@@ -113,6 +122,7 @@ class CandidateModel:
     predict_target: PredictFn | None = None
     state_space: StateSpaceModel | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    sample_step: StepSampler | None = None
 
     @property
     def key(self) -> str:

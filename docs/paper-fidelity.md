@@ -6,6 +6,7 @@ This page records how the implementation follows [arXiv:2608.09696v5](https://ar
 - [Defaults](#defaults)
 - [Agent loop details](#agent-loop-details)
 - [Task VoI (a v4 extension)](#task-voi-a-v4-extension)
+- [Experiment programs (beyond v5)](#experiment-programs-beyond-v5)
 - [Pseudocode corrections](#pseudocode-corrections)
 - [Choices v5 leaves open](#choices-v5-leaves-open)
 - [What changed in v5](#what-changed-in-v5)
@@ -26,6 +27,7 @@ v5 names its algorithms; the numbers are its Appendix A order.
 | `init-hyp-space`, `expand-hyp-space` | `mda.proposer` plus the proposer implementations (`initial_proposals`) |
 | `predictive-check` | `mda.checks` |
 | `VoI` (Eq. voi model, Eq. voiFull joint) | `mda.acquisition` |
+| Beyond v5: experiment programs | `mda.programs`, `mda.program_sandbox`, `mda.program_proposer` |
 
 ## Defaults
 
@@ -71,6 +73,17 @@ v5 keeps only the general decision-theoretic task VoI (Eq. taskvoigeneral) and l
 `design_flavour="task_full_observation"` (or `full_observation_task_value_of_information`) is the older dense-matrix conditional-variance calculation. It uses raw observations at the proposed action and all cross-coordinate information; optional `target_covariance` whitens its loss. This is a coherent Gaussian alternative inspired by v4 Eq. 42, but it is **not** the coordinatewise implementation described after v4 Eq. 45.
 
 Neither objective is exact information gain for a general non-Gaussian mixture.
+
+## Experiment programs (beyond v5)
+
+v5 designs one action at a time. `design_flavour="program"` instead designs a whole episode whose inputs adapt to the observations within it. An LLM writes the programs (`ProgramProposer`), but they are scored numerically. The score is a nested-Monte-Carlo estimate of I(M; Y₁:T | D, program), with closed-loop simulation against belief particles and mda's own likelihood as the inner term. See [Library: experiment programs](library.md#experiment-programs-beyond-v5). The idea is from `expprog` (sunxd3/model-agent); the estimator, with common random numbers and self-exclusion by value, is from an earlier exploratory study.
+
+The completed episode is stored as `Datum(realised_inputs, trajectory)`, so the model side of Algorithm 2 is untouched. The trajectory likelihood is ignorable for a deterministic program, or a program whose randomness does not depend on the model: the inputs carry no information about the model beyond the observations they were chosen from. The predictive check still compares the trajectory with each model's mean trajectory at the realised inputs. That is valid without per-episode latent variables, which this extension does not support.
+
+Known limits:
+
+- Self-exclusion leaves each model's inner sum with one fewer value than the others. With few distinct particles and a sharp likelihood, this biases the estimate downward. In `mda.benchmarks.episodic`, two indistinguishable models scored −1.8 bits with 40 SMC particles each, and −0.03 bits with 200.
+- The inner term calls the generic likelihood once per imagined episode and distinct particle. This dominates the cost: about 6 s per program for 300 particles × 2 models × 200 draws.
 
 ## Pseudocode corrections
 

@@ -12,7 +12,11 @@ from .acquisition import choose_design, value_of_information
 from .checks import TargetFn, identity_target, in_sample_check, predictive_check, residual_report
 from .evidence import EvidenceBackend
 from .posterior import BeliefState, fit_model_posterior
-from .proposer import ModelProposer
+from .programs import (
+    EpisodeSpec, FixedProgram, Program, ProgramError, ProgramScore, belief_summary,
+    disagreement_report, imagined_runs, trajectory_information,
+)
+from .proposer import ModelProposer, ProgramProposer
 from .smc import Likelihood, SMCConfig
 from .types import CandidateModel, Datum
 
@@ -52,6 +56,11 @@ class AgentConfig:
     initial_proposals: int = 0
     expansion_gate: str = "prequential"
     repeat_when_exhausted: bool = False
+    # Experiment programs (design_flavour="program"; beyond v5, see mda.programs).
+    program_cap: int = 8
+    programs_per_proposal: int = 2
+    program_proposal_cap: int = 4
+    program_draws: int = 128
 
     def __post_init__(self) -> None:
         if self.model_cap < 1 or self.new_models_per_expansion < 1:
@@ -60,8 +69,10 @@ class AgentConfig:
             raise ValueError("search and expansion limits cannot be negative")
         if self.error_threshold < 0 or self.occam_penalty < 0:
             raise ValueError("error threshold and Occam penalty cannot be negative")
-        if self.design_flavour not in {"model", "joint", "task", "task_full_observation"}:
+        if self.design_flavour not in {"model", "joint", "task", "task_full_observation", "program"}:
             raise ValueError("unknown design_flavour")
+        if min(self.program_cap, self.programs_per_proposal, self.program_draws) < 1 or self.program_proposal_cap < 0:
+            raise ValueError("program pool sizes and draws must be positive")
         if self.minimum_model_cap is not None and not 1 <= self.minimum_model_cap <= self.model_cap:
             raise ValueError("minimum_model_cap must be between 1 and model_cap")
         if not 0 < self.shrink_confidence <= 1:
@@ -103,6 +114,9 @@ class ModelDiscoveryAgent:
         evidence: EvidenceBackend | None = None,
         check: Callable[[BeliefState, Datum, Sequence[Datum]], float] | None = None,
         seed: int = 0,
+        episode: EpisodeSpec | None = None,
+        programs: Sequence[Program] = (),
+        program_proposer: ProgramProposer | None = None,
     ) -> None:
         self.context = context
         self.evidence = evidence
@@ -132,6 +146,16 @@ class ModelDiscoveryAgent:
             raise ValueError("task value of information needs query_actions")
         self.last_design_scores: np.ndarray | None = None
         self.last_predictive_error: float | None = None
+        if config.design_flavour == "program" and (
+            episode is None or not (programs or program_proposer is not None)
+        ):
+            raise ValueError("program design needs an episode and seed programs or a program proposer")
+        self.episode = episode
+        self.programs: list[Program] = list(programs)
+        self.program_proposer = program_proposer
+        self.program_proposals = 0
+        self._program_proposal_models: frozenset[str] | None = None
+        self.last_program_scores: list[tuple[str, float]] = []
 
         # init-hyp-space: a configured seed library plus, optionally, one LLM
         # batch conditioned only on the context and D0, merged without duplicates.
@@ -241,6 +265,8 @@ class ModelDiscoveryAgent:
             query_actions=self.query_actions,
             target_covariance=self.target_covariance,
         )
+        if self.config.design_flavour == "program":
+            return self._design_program()
         if self.optimizer is not None:
             scores = []
             evaluated = {}
@@ -263,6 +289,81 @@ class ModelDiscoveryAgent:
             action, scores = choose_design(self.available_actions(), self.belief, **options)
         self.last_design_scores = scores
         return action
+
+    def _design_program(self) -> Program:
+        """Choose the program whose closed-loop trajectory is most informative about M.
+
+        Every candidate is scored numerically under one fresh seed (common
+        random numbers); the LLM only writes candidates. The program proposer
+        is called when the model pool differs from the one it last saw (so at
+        the first program design and after expansion or pruning), at most
+        ``program_proposal_cap`` times. The pool keeps the ``program_cap`` best
+        programs by the current score; failing programs and fixed programs
+        whose inputs were already run (unless ``repeat_designs``) leave it.
+        """
+        missing = [model.name for model in self.models if model.sample_step is None]
+        if missing:
+            raise ValueError(f"program design needs sample_step on every model: {missing}")
+        episode = self.episode
+        seed = int(self.rng.integers(2**63 - 1))
+        summary = belief_summary(self.belief)
+
+        def score(program: Program) -> ProgramScore | None:
+            try:
+                return trajectory_information(
+                    program, self.belief, self.likelihood, episode,
+                    draws=self.config.program_draws, seed=seed, summary=summary,
+                )
+            except (ProgramError, ValueError, ArithmeticError):
+                return None
+
+        def used(program: Program) -> bool:
+            return (
+                not self.config.repeat_designs and isinstance(program, FixedProgram)
+                and self.action_key(np.clip(program.inputs, episode.lower, episode.upper))
+                in self.used_action_keys
+            )
+
+        scored: dict[str, tuple[Program, ProgramScore | None]] = {}
+        for program in self.programs:
+            if program.key not in scored and not used(program):
+                scored[program.key] = (program, score(program))
+        model_keys = frozenset(model.key for model in self.models)
+        if (
+            self.program_proposer is not None
+            and model_keys != self._program_proposal_models
+            and self.program_proposals < self.config.program_proposal_cap
+        ):
+            valid = [(program, result) for program, result in scored.values() if result is not None]
+            best = max(valid, key=lambda item: item[1].bits)[1] if valid else None
+            proposals = self.program_proposer.propose(
+                context=self._proposal_context(),
+                dataset=self.dataset,
+                current_models=self.models,
+                disagreements={
+                    "predictions": disagreement_report(self.belief, episode),
+                    "imagined_runs_of_best_program": (
+                        imagined_runs(best, self.belief) if best is not None else {}
+                    ),
+                },
+                current_programs=[(program, result.bits) for program, result in valid],
+                count=self.config.programs_per_proposal,
+            )
+            self.program_proposals += 1
+            self._program_proposal_models = model_keys
+            for program in proposals:
+                if program.key not in scored and not used(program):
+                    scored[program.key] = (program, score(program))
+        ranked = sorted(
+            ((program, result) for program, result in scored.values() if result is not None),
+            key=lambda item: -item[1].bits,
+        )
+        self.programs = [program for program, _ in ranked[: self.config.program_cap]]
+        self.last_program_scores = [(program.label, result.bits) for program, result in ranked]
+        self.last_design_scores = np.asarray([result.bits for _, result in ranked])
+        if not ranked:
+            raise ValueError("no candidate program could be scored")
+        return ranked[0][0]
 
     def update_state(self, action: Any, observation: np.ndarray) -> float:
         """Absorb one result, expanding only after a failed prequential check.

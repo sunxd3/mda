@@ -25,7 +25,7 @@ The Model Discovery Agent (MDA) learns a mechanistic model of a system from very
 - **M-open model discovery**: prequential predictive checks and residual-guided structure expansion, following v5's Algorithm 2.
 - **Three evidence backends**: likelihood-tempered SMC (the default), recursive per-experiment updates, and multistart optimization with BIC.
 - **Likelihoods**: exact Gaussian for deterministic simulators, a bootstrap particle filter for stochastic state-space models, and Bayesian synthetic likelihood.
-- **Experiment design**: model EIG and joint model/parameter EIG over a finite menu or a continuous box searched by CMA-ES.
+- **Experiment design**: model EIG and joint model/parameter EIG over a finite menu or a continuous box searched by CMA-ES; optionally (beyond v5), adaptive multi-step programs written by an LLM in a sandbox and scored by closed-loop simulation.
 - **LLM proposers**: AST-validated symbolic laws and NumPyro programs, with OpenAI and Anthropic API clients or the Claude Code and Codex agents, response caching, and credential-free replay.
 - **Benchmark runners** for the paper's domains: ChemBench, GlucoseBench, the stochastic neuron benchmark (NeuronBench), BoxingGym, and the v4-only ForceBench.
 

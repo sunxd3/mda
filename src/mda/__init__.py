@@ -14,11 +14,23 @@ from .neuronbench_adapter import NeuronBenchEnvironment, NeuronBenchProposer, Ne
 from .openai_client import OpenAIJSONClient
 from .optimizers import CMAESOptimizer
 from .posterior import BeliefState, ModelFit, fit_model_posterior
-from .proposer import ModelProposer
+from .program_proposer import LLMProgramProposer
+from .program_sandbox import compile_program
+from .programs import EpisodeSpec, FixedProgram, Program, gaussian_step, run_episode, trajectory_information
+from .proposer import ModelProposer, ProgramProposer
 from .smc import SMCConfig, parameter_posterior
 from .types import CandidateModel, Datum, StateSpaceModel, UniformPrior
 
 __all__ = [
+    "EpisodeSpec",
+    "FixedProgram",
+    "LLMProgramProposer",
+    "Program",
+    "ProgramProposer",
+    "compile_program",
+    "gaussian_step",
+    "run_episode",
+    "trajectory_information",
     "AgentConfig",
     "BICEvidence",
     "BayesianSyntheticLikelihood",

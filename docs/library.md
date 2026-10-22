@@ -199,6 +199,44 @@ The agent identifies used designs by `action_key(action)`. The default is exact 
 
 Pass `experiment_budget=B` to include the remaining budget in the proposal context and to make `design()` raise after B updates.
 
+### Experiment programs (beyond v5)
+
+An experiment can be an *episode* of `T` scalar inputs in which each input is chosen after seeing the observations so far. `design_flavour="program"` makes `design()` return a **program**, `step(history, belief) -> next input`, instead of an action. This is an extension beyond v5; every default is unchanged, and nothing here runs unless you select it.
+
+```python
+from mda import AgentConfig, EpisodeSpec, LLMProgramProposer, ModelDiscoveryAgent, gaussian_step, run_episode
+from mda.programs import belief_summary
+
+episode = EpisodeSpec(steps=5, lower=0.0, upper=1.0)
+# Each model needs sample_step; for a deterministic model with Gaussian noise:
+#   CandidateModel(..., predict=predict, sample_step=gaussian_step(predict, std))
+agent = ModelDiscoveryAgent(
+    ..., actions=[], episode=episode,
+    config=AgentConfig(design_flavour="program"),
+    programs=seed_programs,                                    # like initial_models
+    program_proposer=LLMProgramProposer(client, episode),      # optional
+)
+program = agent.design()
+inputs, trajectory = run_episode(program, environment, episode, belief_summary(agent.belief))
+agent.update_state(inputs, trajectory)                         # an ordinary datum
+```
+
+**Contract.**
+
+- *Models.* `CandidateModel.sample_step(theta, inputs, observations, rng) -> y` draws the next observation given the episode so far (`inputs` includes the new one). `gaussian_step(predict, std)` builds it when `predict(theta, inputs)` returns the mean trajectory for any prefix of inputs. `predict` alone is a whole-action mean and cannot simulate a closed loop in general.
+- *Environments.* `start_episode()` and `observe(u) -> y`. `run_episode` executes the program and returns the realised inputs and trajectory, which go to `update_state` unchanged as `Datum(action=inputs, observation=trajectory)`. Fitting, checks, expansion and `action_key` see an ordinary array action. `FixedProgram(inputs)` is an ordinary action as a program. `mda.benchmarks.reproduce.run(..., design="program")` does this for you.
+- *Programs.* The source of one class with one method, `step(self, history, belief)`. `history` has `inputs`, `obs`, `t`, `horizon`, `obs_at(i)` and `last_obs()`. `belief` is `programs.belief_summary(agent.belief)`: model weights, parameter means and SDs per model, and pooled over models. Programs are stateless and deterministic, and inputs are clipped to the episode bounds. Episodes have a fixed length.
+
+**Scoring.** Each candidate is scored by `trajectory_information`: a nested-Monte-Carlo estimate of the information, in bits, that the whole trajectory carries about the model index. Each imagined episode runs closed loop against one belief particle with that model's `sample_step`. The inner term is the agent's own `likelihood` of the datum `(inputs, trajectory)`. Every candidate in one decision shares one fresh seed (common random numbers). The outer particle is excluded from its own model's inner sum *by value*, so SMC duplicates do not inflate the estimate. The LLM never scores anything. A program that raises, returns a non-number, or breaks a sandbox limit is dropped from the pool.
+
+**Program pool.** Like the model pool, it is capped (`program_cap`) and pruned to the best current scores at each decision. Fixed programs whose inputs were already run are dropped unless `repeat_designs`. The program proposer is called at a decision whenever the set of models differs from the one it last saw: at the first program design and after expansion or pruning. It is called at most `program_proposal_cap` times, for `programs_per_proposal` programs each.
+
+**Proposers.** A `ProgramProposer` mirrors `ModelProposer`. `propose(context, dataset, current_models, disagreements, current_programs, count)` returns programs. `disagreements` holds each model's one-step predictive mean and SD on an input grid, and imagined episodes of the best current program under each model. `LLMProgramProposer(client, episode)` works with every client below, including caching and replay.
+
+**Sandbox.** `mda.program_sandbox.compile_program(source)` admits LLM source in two layers. First, an AST whitelist: arithmetic, `if`, `for` over `range`, assignments, a few builtins, `math.*`, and the `history` attributes. It rejects imports, `while`, other functions, lambdas, comprehensions, `try`, underscore names, `self`, and any other attribute or call. Second, the source runs only in a separate `python -I -S` worker with CPU and memory limits, dangerous modules removed, and whitelisted builtins. The scorer sends the worker all imagined histories of one step at once, so scoring costs one round trip per episode step. The sandbox reduces risk; for untrusted proposals, still run in an isolated environment.
+
+`mda.benchmarks.episodic` is a small test domain: a device whose two mechanisms differ only just above an unknown threshold, so a program that brackets the threshold within the episode beats a fixed protocol.
+
 ## Proposers: making the pool M-open
 
 Without a proposer the pool is fixed. Pass `proposer=` to let the agent add structures. A proposer implements the `ModelProposer` protocol:
@@ -296,7 +334,7 @@ Codex sets up its state directory (`CODEX_HOME`, default `~/.codex`) on its firs
 | `occam_penalty` | 0.0 | λ in the model prior `p(m) ∝ exp(−λk)`; 0 is uniform |
 | `predictive_floor` | 1e-6 | Denominator floor for relative residuals |
 | `backtest` | True | Include earlier data in the predictive check |
-| `design_flavour` | `"model"` | `model`, `joint`, `task`, or `task_full_observation` |
+| `design_flavour` | `"model"` | `model`, `joint`, `task`, `task_full_observation`, or `program` (beyond v5) |
 | `repeat_designs` | False | Allow repeated designs |
 | `repeat_when_exhausted` | False | Allow repeats only once the menu is used up |
 | `smc` | `SMCConfig()` | Settings for the default tempered-SMC evidence |
@@ -304,6 +342,10 @@ Codex sets up its state directory (`CODEX_HOME`, default `~/.codex`) on its firs
 | `shrink_confidence` | 0.9 | MAP weight required before shrinking |
 | `initial_proposals` | 0 | Size of the LLM batch at initialization |
 | `expansion_gate` | `"prequential"` | `"cached"` gates the first expansion on the previous fit's in-sample residuals, as v5's executed ChemBench agent does |
+| `program_cap` | 8 | Maximum program-pool size (program design only) |
+| `programs_per_proposal` | 2 | Programs requested per program-proposer call |
+| `program_proposal_cap` | 4 | Total program-proposer calls allowed |
+| `program_draws` | 128 | Imagined episodes per program score |
 
 Shrinking requires both a well-fit MAP model (median relative residual at most `error_threshold`) and a MAP weight above `shrink_confidence`; otherwise the cap is `model_cap`. It never runs at initialization. A failed check restores the larger cap, but evicted models are not resurrected.
 
@@ -329,6 +371,7 @@ These defaults are v4 Table 2's ChemBench settings, since v5 gives no values. Ou
 | `target_covariance`, `task_noise_covariance` | Task-VoI loss whitening and target-space noise |
 | `check(belief, fresh, history)` | Replaces the default predictive check; compared against `error_threshold` |
 | `seed` | Seeds all agent randomness |
+| `episode`, `programs`, `program_proposer` | Program design: the episode shape, the seed program library, and the optional program proposer |
 
 ## Diagnostics
 

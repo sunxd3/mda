@@ -11,6 +11,7 @@ from typing import Any
 
 import numpy as np
 
+from mda.programs import Program, belief_summary, run_episode
 from mda.types import NonFinitePrediction
 
 
@@ -152,7 +153,8 @@ def run(environment, agent, *, budget, smoke=False, prediction="map",
                 history[-1]["icl_score"] = None
                 history[-1]["icl_error"] = f"{type(error).__name__}: {error}"
 
-    if agent.optimizer is None and not (agent.config.repeat_designs or agent.config.repeat_when_exhausted):
+    if agent.optimizer is None and design != "program" and not (
+            agent.config.repeat_designs or agent.config.repeat_when_exhausted):
         if budget > len(agent.available_actions()):
             raise ValueError(f"budget {budget} exceeds the {len(agent.available_actions())} unused designs")
     design_rng = agent.random_design_rng()
@@ -172,7 +174,14 @@ def run(environment, agent, *, budget, smoke=False, prediction="map",
                 action = choices[int(design_rng.integers(len(choices)))]
             else:
                 action = agent.design()
-            observation = environment.step(action)
+            if isinstance(action, Program):
+                # The environment is observed one input at a time; the
+                # completed episode is an ordinary datum (realised inputs,
+                # trajectory) for update_state.
+                action, observation = run_episode(
+                    action, environment, agent.episode, belief_summary(agent.belief))
+            else:
+                observation = environment.step(action)
             agent.update_state(action, observation)
             snapshot(action, observation)
     except Exception as error:
