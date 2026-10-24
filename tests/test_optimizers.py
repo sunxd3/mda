@@ -85,3 +85,20 @@ def test_flat_score_still_spends_the_full_budget():
 
     CMAESOptimizer([0.0] * 7, [1.0] * 7, max_evaluations=48)(score, np.random.default_rng(0))
     assert calls == 48
+
+
+def test_differential_evolution_spends_exactly_its_budget_and_returns_the_best_seen():
+    import numpy as np
+    from mda.optimizers import DifferentialEvolutionOptimizer
+
+    seen = []
+
+    def score(xs):
+        values = [float(-np.sum((x - .3) ** 2)) for x in xs]
+        seen.extend(values)
+        return values
+
+    best = DifferentialEvolutionOptimizer(np.zeros(6), np.ones(6), max_evaluations=144)(
+        score, np.random.default_rng(1))
+    assert len(seen) == 144
+    assert -np.sum((best - .3) ** 2) == max(seen)

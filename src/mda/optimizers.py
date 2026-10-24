@@ -134,3 +134,50 @@ class CMAESOptimizer:
         if best_action is None:
             raise ValueError("CMA-ES did not observe a finite score")
         return best_action
+
+
+class DifferentialEvolutionOptimizer(CMAESOptimizer):
+    """Maximize a score over the same box with SciPy's differential evolution.
+
+    The score is *batched*: it takes a list of actions and returns their
+    scores, so each generation of ``population_size * dimension`` candidates
+    is scored in one call (SciPy's vectorized, deferred-update DE). Generations
+    run until ``max_evaluations`` is spent; there is no polishing step. Bounds,
+    log axes, ``decode`` and ``sample`` behave as in :class:`CMAESOptimizer`.
+    """
+
+    batched = True
+
+    def __init__(self, lower: Any, upper: Any, *, population_size: int = 4, **options: Any) -> None:
+        super().__init__(lower, upper, **options)
+        if population_size < 1:
+            raise ValueError("population_size must be positive")
+        self.population_size = population_size
+
+    def __call__(self, score: Callable[[list[Any]], Any], rng: np.random.Generator) -> Any:
+        from scipy.optimize import differential_evolution
+
+        dimension = self.lower.size
+        generation = self.population_size * dimension
+        if self.max_evaluations < generation:
+            raise ValueError("max_evaluations must cover at least one generation")
+        best: list[Any] = [None, -np.inf]
+
+        def loss(units: np.ndarray) -> np.ndarray:
+            actions = [self.decode(self._domain_vector(unit)) for unit in np.atleast_2d(units.T)]
+            values = np.asarray(score(actions), dtype=float)
+            for action, value in zip(actions, values, strict=True):
+                if np.isfinite(value) and value > best[1]:
+                    best[:] = [action, float(value)]
+            # A finite penalty keeps SciPy's convergence statistics defined.
+            return np.where(np.isfinite(values), -values, 1e300)
+
+        differential_evolution(
+            loss, [(0.0, 1.0)] * dimension, popsize=self.population_size,
+            maxiter=self.max_evaluations // generation - 1, polish=False, tol=0.0, atol=0.0,
+            init="latinhypercube", vectorized=True, updating="deferred",
+            rng=np.random.default_rng(int(rng.integers(0, np.iinfo(np.uint32).max, dtype=np.uint32))),
+        )
+        if best[0] is None:
+            raise ValueError("differential evolution did not observe a finite score")
+        return best[0]

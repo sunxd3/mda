@@ -8,7 +8,7 @@ from typing import Any
 
 import numpy as np
 
-from .acquisition import choose_design, value_of_information
+from .acquisition import choose_design, value_of_information, value_of_information_many
 from .checks import TargetFn, identity_target, in_sample_check, predictive_check, residual_report
 from .evidence import EvidenceBackend
 from .posterior import BeliefState, fit_model_posterior
@@ -255,7 +255,22 @@ class ModelDiscoveryAgent:
                 evaluated[key] = value
                 return value
 
-            action = self.optimizer(score, self.rng)
+            def score_many(actions):
+                actions = list(actions)
+                repeated = [not self.config.repeat_designs and self.action_key(a) in self.used_action_keys
+                            for a in actions]
+                values = np.full(len(actions), -np.inf)
+                fresh = [a for a, used in zip(actions, repeated, strict=True) if not used]
+                if fresh:
+                    values[~np.asarray(repeated)] = value_of_information_many(fresh, self.belief, **options)
+                for a, value in zip(actions, values, strict=True):
+                    scores.append(float(value))
+                    evaluated[self.action_key(a)] = float(value)
+                return values
+
+            # A ``batched`` optimizer scores a whole population per call.
+            action = self.optimizer(score_many if getattr(self.optimizer, "batched", False) else score,
+                                    self.rng)
             if not np.isfinite(evaluated.get(self.action_key(action), -np.inf)):
                 raise ValueError("optimizer must return an evaluated, finite, non-repeated design")
             scores = np.asarray(scores)

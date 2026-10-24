@@ -86,6 +86,7 @@ A finite-menu run whose budget exceeds the unused designs fails before it starts
 | `--difficulty` | chemistry | Default `medium` (v5's setting) |
 | `--inference {bic,smc}` | chemistry | Profiled-BIC primary arm (default) or the SMC control |
 | `--cuts`, `--replicate` | glucose | Forecast cuts in minutes (0, 45, 120, 180; default 45) and replicate (default 0) |
+| `--design-space {menu,continuous}`, `--check {v4,chi2,guided}`, `--max-params` | central two-particle physics | The 13-action menu (default) or the continuous launch box; v4's expansion check (default), a χ² test on the fresh trajectory, or that test with residual-guided expansions; and a cap on free parameters per law; see [ForceBench](benchmarks/forcebench.md#continuous-design-and-the-expansion-check) |
 | `--stochastic` | neuron | Use v5's stochastic neuron environment (the deterministic one is v4 legacy) |
 | `--online-expansion` | stochastic neuron | Re-enable model births after initialization |
 | `--task-noise-variance` | `--design task` | Target-space noise. Required for neuron task design: one or six positive feature-space variances |

@@ -94,9 +94,9 @@ def test_force_proposer_drops_invalid_laws_but_keeps_their_valid_siblings():
     from mda.types import Datum
 
     hypotheses = [
-        {"name": "divides", "expr": "a*qi*qj/r + 1/0", "params": [{"name": "a", "low": 0.1, "high": 2.0}]},
-        {"name": "overflows", "expr": "a*qi*qj/r*10.0**400", "params": [{"name": "a", "low": 0.1, "high": 2.0}]},
-        {"name": "fine", "expr": "a*qi*qj/r", "params": [{"name": "a", "low": 0.1, "high": 2.0}]},
+        {"name": "divides", "fmag": "a*qi*qj/r + 1/0", "params": [{"name": "a", "low": 0.1, "high": 2.0}]},
+        {"name": "overflows", "fmag": "a*qi*qj/r*10.0**400", "params": [{"name": "a", "low": 0.1, "high": 2.0}]},
+        {"name": "fine", "fmag": "a*qi*qj/r", "params": [{"name": "a", "low": 0.1, "high": 2.0}]},
     ]
 
     class Client:
@@ -107,3 +107,67 @@ def test_force_proposer_drops_invalid_laws_but_keeps_their_valid_siblings():
     models = ForceProposer(Client()).propose(
         context="", dataset=[Datum(action, np.zeros((2, 2)))], current_models=[], residuals=[], count=3)
     assert [m.name for m in models] == ["fine"]
+
+
+def test_continuous_launches_keep_direction_but_respect_the_minimum_radius():
+    from mda.benchmarks.physics import continuous_action
+
+    action = continuous_action([.1, -.2, 1, 2, 3, 4])
+    np.testing.assert_allclose(np.hypot(*action["pos2"]), .5)
+    np.testing.assert_allclose(np.arctan2(action["pos2"][1], action["pos2"][0]), np.arctan2(-.2, .1))
+    assert (action["velocity2"], action["p1"], action["p2"]) == ([1., 2.], 3., 4.)
+    assert continuous_action([4, 0, 0, 0, 1, 1])["pos2"] == [4., 0.]
+
+
+def test_chi2_check_fails_a_charge_blind_law_on_one_charge_probe():
+    from mda.benchmarks.physics import _action, fresh_chi2_check
+    from mda.likelihoods import DeterministicGaussianLikelihood
+    from mda.posterior import fit_model_posterior
+    from mda.smc import SMCConfig
+    from mda.types import Datum
+
+    true = force_candidate("true", "k*qi*qj/r**2", ("k",), (.01,), (5.,))
+    blind = force_candidate("blind", "k/r**2", ("k",), (.01,), (5.,))
+    seed_drop = [Datum(_action(3), true.predict(np.array([1.]), _action(3)))]
+    probe = _action(4, p1=3)
+    fresh = Datum(probe, true.predict(np.array([1.]), probe))
+    checks = []
+    for model in (true, blind):
+        belief = fit_model_posterior(seed_drop, [model], DeterministicGaussianLikelihood(.05),
+                                     SMCConfig(parameter_particles=60), model_cap=1,
+                                     occam_penalty=0., rng=np.random.default_rng(0))
+        checks.append(fresh_chi2_check(belief, fresh, seed_drop))
+    # Both laws fit the unit-charge drop; only a charge intervention separates them.
+    assert checks[0] < 1 < checks[1]
+
+
+def test_guided_proposer_shows_where_the_best_law_fails_and_caps_parameters():
+    from types import SimpleNamespace
+    from mda.benchmarks.physics import ForceProposer, _action
+    from mda.types import Datum
+
+    law = force_candidate("blind", "k/r**2", ("k",), (.01,), (5.,))
+    fit = SimpleNamespace(model=law, parameters=SimpleNamespace(map_parameters=np.array([1.])))
+    probe = _action(4, p1=3)
+    true = force_candidate("true", "k*qi*qj/r**2", ("k",), (.01,), (5.,))
+    data = [Datum(probe, true.predict(np.array([1.]), probe))]
+    prompts = []
+
+    class Client:
+        def ask_json(self, system, prompt, **kwargs):
+            prompts.append(prompt)
+            return {"hypotheses": [
+                {"name": "wide", "fmag": "a*qi*qj/r**b + c*exp(-r/d)", "operator": "", "rationale": "",
+                 "params": [{"name": n, "low": .1, "high": 2.} for n in "abcd"]},
+                {"name": "ok", "fmag": "a*qi*qj/r**2", "operator": "", "rationale": "",
+                 "params": [{"name": "a", "low": .1, "high": 2.}]}]}
+
+    proposer = ForceProposer(Client(), guided=True, max_parameters=3)
+    proposer.agent = SimpleNamespace(belief=SimpleNamespace(map_fit=fit))
+    models = proposer.propose(context="", dataset=data, current_models=[law], residuals=[], count=6)
+    assert [m.name for m in models] == ["ok"]
+    assert "Current best law: F_mag = k / r ** 2 with k=1." in prompts[0]
+    assert "at most 3 free parameters" in prompts[0]
+    # The blind law misses the charge-3 probe by far more than the noise.
+    misfit = float(prompts[0].split("per experiment in order:\n")[1].split("\n")[0])
+    assert misfit > 5

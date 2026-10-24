@@ -81,6 +81,15 @@ def model_eig(
         if weight == 0.0:
             continue
         keep = fit.parameters.weights > 0
+        predict_many = fit.model.metadata.get("predict_many")
+        if predict_many is not None:
+            predictions = np.asarray(predict_many(fit.parameters.particles[keep], action), dtype=float)
+            predictions = predictions.reshape(len(predictions), -1)
+            if np.any(~np.isfinite(predictions)):
+                raise NonFinitePrediction(f"model {fit.model.name!r} returned a non-finite prediction")
+            model_means.append(weighted_mean(predictions, fit.parameters.weights[keep]))
+            model_weights.append(weight)
+            continue
         predictions = np.stack([
             _flat(fit.model.observation_prediction(theta, action))
             for theta in fit.parameters.particles[keep]
@@ -213,6 +222,55 @@ def value_of_information(
         # A weighted model that cannot predict this action makes it unusable;
         # the same errors give that model -inf likelihood when fitting.
         return -np.inf
+
+
+def value_of_information_many(
+    actions: Sequence[Any],
+    belief: BeliefState,
+    *,
+    flavour: str,
+    observation_covariance: float | np.ndarray,
+    **options,
+) -> np.ndarray:
+    """``value_of_information`` for many actions at once.
+
+    Model EIG is computed in one batch when every weighted structure supplies
+    ``metadata["predict_grid"]`` (all parameter rows under all actions);
+    otherwise, and for the other flavours, actions are scored one by one.
+    An action at which any weighted structure predicts a non-finite value
+    scores ``-inf``, as in ``value_of_information``.
+    """
+    def one_by_one() -> np.ndarray:
+        return np.asarray([
+            value_of_information(action, belief, flavour=flavour,
+                                 observation_covariance=observation_covariance, **options)
+            for action in actions
+        ], dtype=float)
+
+    fits = [(weight, fit) for weight, fit in zip(belief.model_weights, belief.fits, strict=True)
+            if weight != 0.0]
+    if flavour != "model" or not all("predict_grid" in fit.model.metadata for _, fit in fits):
+        return one_by_one()
+    finite = np.ones(len(actions), dtype=bool)
+    model_means = []
+    for _, fit in fits:
+        keep = fit.parameters.weights > 0
+        try:
+            grid = fit.model.metadata["predict_grid"](fit.parameters.particles[keep], actions)
+        except (ValueError, ArithmeticError):
+            return one_by_one()
+        means = []
+        for index, predictions in enumerate(grid):
+            predictions = np.asarray(predictions, dtype=float).reshape(len(predictions), -1)
+            finite[index] &= bool(np.all(np.isfinite(predictions)))
+            means.append(weighted_mean(predictions, fit.parameters.weights[keep]))
+        model_means.append(means)
+    weights = np.asarray([weight for weight, _ in fits])
+    scores = np.full(len(actions), -np.inf)
+    for index in np.flatnonzero(finite):
+        means = np.stack([model[index] for model in model_means])
+        scores[index] = _weighted_disagreement(means, weights, observation_covariance)
+    return scores
 
 
 def choose_design(

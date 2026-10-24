@@ -54,6 +54,34 @@ class DeterministicGaussianLikelihood:
             return -np.inf
         return total if np.isfinite(total) else -np.inf
 
+    def batch(self, dataset: Sequence[Datum], model: CandidateModel, thetas: np.ndarray) -> np.ndarray:
+        """Log-likelihoods of many parameter rows through ``metadata["predict_many"]``.
+
+        Matches calling the likelihood row by row: a row with a non-finite
+        prediction scores ``-inf``.
+        """
+        predict_many = model.metadata["predict_many"]
+        if callable(self.observation_std):
+            return np.asarray([self(dataset, model, theta, None) for theta in thetas], dtype=float)
+        std = np.asarray(self.observation_std, dtype=float)
+        if np.any(~np.isfinite(std)) or np.any(std <= 0):
+            raise ValueError("observation standard deviations must be finite and positive")
+        total = np.zeros(len(thetas))
+        predict_grid = model.metadata.get("predict_grid")
+        grid = (predict_grid(thetas, [datum.action for datum in dataset])
+                if predict_grid is not None else [predict_many(thetas, d.action) for d in dataset])
+        for datum, predictions in zip(dataset, grid, strict=True):
+            observed = np.asarray(datum.observation, dtype=float)
+            predictions = np.asarray(predictions, dtype=float)
+            if predictions.shape[1:] != observed.shape:
+                raise ValueError(f"observation shape {observed.shape} != prediction shape {predictions.shape[1:]}")
+            with np.errstate(all="ignore"):
+                residual = (observed - predictions) / std
+                total += -0.5 * np.sum(
+                    (residual * residual + 2 * np.log(std) + np.log(2 * np.pi)).reshape(len(thetas), -1),
+                    axis=1)
+        return np.where(np.isfinite(total), total, -np.inf)
+
 
 def _simulate_traces(model, theta, datum, count, std, rng) -> np.ndarray:
     """Draw ``count`` noisy trajectories with the datum's shape from the SSM."""

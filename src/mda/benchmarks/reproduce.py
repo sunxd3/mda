@@ -16,7 +16,8 @@ from mda.types import NonFinitePrediction
 
 def build(domain, world, client, *, seed, smoke, budget, stochastic=False,
           difficulty="medium", allow_code_execution=False, method="mda",
-          inference=None, llm_initialization=True, online_expansion=False):
+          inference=None, llm_initialization=True, online_expansion=False,
+          design_space="menu", check="v4", max_parameters=None):
     if method not in {"mda", "apprentice"} or (method == "apprentice" and domain != "boxing"):
         raise ValueError("apprentice is supported only for Boxing")
     if domain == "boxing":
@@ -36,7 +37,8 @@ def build(domain, world, client, *, seed, smoke, budget, stochastic=False,
             environment = PhysicsExtraEnvironment(world, seed)
         else:
             environment = PhysicsEnvironment(world, seed)
-        extra = {}
+        extra = {} if (design_space, check, max_parameters) == ("menu", "v4", None) else {
+            "design_space": design_space, "check": check, "max_parameters": max_parameters}
     elif domain == "neuron":
         from .neuron import make_agent
         from mda.neuronbench_adapter import NeuronBenchEnvironment
@@ -96,10 +98,13 @@ def run(environment, agent, *, budget, smoke=False, prediction="map",
             evaluable = all(np.all(np.isfinite(p)) for p in predictions)
         except (NonFinitePrediction, ArithmeticError):
             predictions, evaluable = [], False
-        if not evaluable and not scored_by_metrics:
+        failed_score = getattr(environment, "failed_score", None)
+        if not evaluable and not scored_by_metrics and failed_score is None:
             raise ValueError("non-finite query prediction")
         metrics = None
-        if evaluate and scored_by_metrics:
+        if evaluate and not evaluable and failed_score is not None:
+            score = float(failed_score)
+        elif evaluate and scored_by_metrics:
             metrics = environment.evaluation_metrics(predictor)
             score = float(metrics["nmsle"])
             if not np.isfinite(score):
@@ -204,6 +209,14 @@ def main():
     parser.add_argument("--allow-code-execution", action="store_true",
                         help="UNSAFE: execute generated NumPyro Python with process privileges")
     parser.add_argument("--design", choices=["model", "joint", "task", "random"], default="model")
+    parser.add_argument("--design-space", choices=["menu", "continuous"], default="menu",
+                        help="physics: the 13-action menu (v4) or the continuous launch box")
+    parser.add_argument("--check", choices=["v4", "chi2", "guided"], default="v4",
+                        help="physics expansion check: v4's median relative residual > 1.4, "
+                             "a chi-squared test on the fresh trajectory, or that test with one "
+                             "residual-guided expansion per experiment")
+    parser.add_argument("--max-params", type=int,
+                        help="physics: drop proposed laws with more free parameters")
     parser.add_argument("--prediction", choices=["map", "bma"],
                         help="default: bma for Boxing and GlucoseBench, map for other domains")
     parser.add_argument("--task-noise-variance", type=float, nargs="+")
@@ -237,6 +250,9 @@ def main():
         parser.error("task noise variances must be positive; neuron needs one or six values")
     if args.inference is not None and args.domain != "chemistry":
         parser.error("--inference applies only to chemistry")
+    if (args.design_space, args.check, args.max_params) != ("menu", "v4", None) and (
+            args.domain != "physics" or args.world in {"circle", "ether", "hubble"}):
+        parser.error("--design-space, --check and --max-params apply only to the central two-particle physics worlds")
     if args.difficulty is not None and args.domain != "chemistry":
         parser.error("--difficulty applies only to chemistry")
     if (args.cuts is not None or args.replicate is not None) and args.domain != "glucose":
@@ -299,7 +315,8 @@ def main():
         smoke=args.smoke, budget=args.budget, stochastic=args.stochastic,
         difficulty=args.difficulty, allow_code_execution=args.allow_code_execution, method=args.agent,
         inference=args.inference, llm_initialization=not fixed_library,
-        online_expansion=args.online_expansion)
+        online_expansion=args.online_expansion, design_space=args.design_space, check=args.check,
+        max_parameters=args.max_params)
     if args.task_noise_variance is not None:
         agent.task_noise_covariance = (args.task_noise_variance[0] if len(args.task_noise_variance) == 1
                                        else np.asarray(args.task_noise_variance))

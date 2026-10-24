@@ -1,9 +1,10 @@
 # Replication
 
-We have run two of the paper's main benchmarks end to end with live LLM calls. Both match the paper. NeuronBench and BoxingGym have not been swept.
+We have run two of the paper's main benchmarks end to end with live LLM calls. Both match the paper. NeuronBench and BoxingGym have not been swept. We also ran ForceBench, which v5 dropped, against the continuous-action setup of a later physics writeup.
 
 - [ChemBench](#chembench): 78.9% pass rate at 25 observations (paper 78.4%).
 - [GlucoseBench](#glucosebench): CGM nMSE 0.25 after six episodes (paper 0.316), with Codex as the LLM.
+- [ForceBench, continuous design](#forcebench-continuous-design): nMSE 0.004 at 13 experiments (writeup ≈0.10), but the model pool never expands; a guided expansion arm lowers error about 2× over the learning curve.
 
 ## ChemBench
 
@@ -94,3 +95,71 @@ Patient-level geometric means of training-variance-normalized MSE, pooled over o
 - One run per patient, so the interval reflects variation across patients, not LLM randomness.
 - Codex wraps the request differently from the direct API (the system prompt is a developer message), so this is not the paper's exact client.
 - Only the 45-minute cut was compared; v5 also reports cuts at 0, 120 and 180 minutes. Other differences are listed under [GlucoseBench](benchmarks/glucosebench.md).
+
+## ForceBench, continuous design
+
+v5 dropped ForceBench. A later writeup by the authors (not on arXiv) reran it with MDA and the DiscoverPhysics agent (DP-Agent) in the same continuous launch box, instead of v4's 13-action menu, and found the gap between them small (paired loss ratio 0.58, 95% CI [0.10, 3.15]). Its explanation is that the menu leaked which experiments are informative. We replicated the MDA side and then tested a competing explanation: that MDA explores model space too little. VoI only values experiments on which the models already in the pool disagree. If every candidate shares the same mistake, the experiment that would expose it scores zero, is never run, and nothing pushes the agent to a structurally new law.
+
+![ForceBench: four arms against the writeup's Fig. 1a](images/forcebench-replication.png)
+
+### Result
+
+Four arms, 6 worlds × 3 seeds each, 13 designed experiments, all 72 runs complete. All arms replay the same 18 initial LLM pools and make the same first design, so within a world and seed the arms differ only in the listed setting.
+
+| Arm | Check | Proposer | Expansions per run | nMSE at 13 | nMSE over 1–13 |
+|---|---|---|---|---|---|
+| Replication | v4 (τₑ = 1.4) | v4 prompt | 0 | 0.0043 | 0.0061 |
+| Cap only | v4 | v4 prompt, ≤3 parameters | 0 | 0.0035 | 0.0055 |
+| χ² | χ² on fresh trajectory | v4 prompt | 7.9 | 0.0117 | 0.0077 |
+| Guided | χ², ≤1 expansion per experiment | shows misfit, ≤3 parameters | 7.8 | **0.0021** | **0.0027** |
+
+nMSE is the world-first geometric mean (seeds within a world, then worlds). The writeup's MDA reaches about 0.10 at 13 experiments and DP-Agent about 0.14 (read off its Fig. 1a).
+
+Paired ratios, world-first, with 95% world-bootstrap intervals:
+
+| Comparison | At 13 | Over 1–13 | Lower on |
+|---|---|---|---|
+| χ² ÷ replication | 2.70 [1.41, 4.73] | 1.27 [0.82, 2.03] | 1/6 worlds at 13 |
+| Cap only ÷ replication | 0.81 [0.24, 3.47] | 0.91 [0.48, 1.84] | 3/6 over the curve |
+| Guided ÷ replication | 0.48 [0.09, 1.87] | **0.45 [0.21, 0.88]** | 5/6 over the curve |
+| Guided ÷ cap only | 0.59 [0.15, 2.39] | **0.49 [0.30, 0.78]** | 5/6 over the curve |
+| Guided ÷ χ² | **0.18 [0.05, 0.51]** | **0.35 [0.15, 0.72]** | 6/6 at 13 |
+
+Per world, averaged over budgets 1–13:
+
+| World | Replication | Cap only | χ² | Guided |
+|---|---|---|---|---|
+| gravity | 5.8e-5 | 3.1e-5 | 9.3e-5 | **5.5e-6** |
+| yukawa | **6.0e-5** | 2.3e-4 | 8.4e-5 | 9.3e-5 |
+| coulomb | 1.1 | 1.4 | 0.91 | **0.72** |
+| oscillator | 0.85 | **0.39** | 0.99 | 0.49 |
+| fractional | 1.8e-4 | 2.8e-4 | 6.4e-4 | **1.3e-4** |
+| extra-dim | 0.084 | 0.025 | 0.047 | **0.017** |
+
+### What the runs show
+
+1. **v4's check never fires, so the pool is frozen.** It needs the median relative position error over the fresh and every stored trajectory to exceed 140%. In all 36 runs with this check (replication and cap only), it fired 0 times and the 24-law pool from the seed drop never changed. v5 notes that the median can delay expansion; with τₑ = 1.4 the delay is permanent. It also says the executed DP agent used this kind of gate, so the writeup's runs were likely frozen too, but we have not seen its code or logs.
+2. **A frozen pool still predicts well here.** Our replication is about 20× below the writeup's MDA overall and avoids its oscillator blow-up. Yukawa reaches 6e-5 without ever containing the true K₁(r/λ)/λ kernel, because near-equivalent screened laws match it on the held-out launches.
+3. **Letting expansion fire is not enough.** The χ² arm spends its 8 expansions within the first 4–7 experiments, after which large misfits go unanswered, and the LLM adds terms rather than changing structure: its final laws average 5.3 free parameters against 2.9 in the replication, with time modulation, softening and oscillating corrections. It ends 2.7× worse than the replication.
+4. **Guided expansion helps.** Showing the proposer the current best law, its misfit on every experiment in units of σ, and the latest trajectory observed against predicted, asking for structurally different laws, capping laws at 3 parameters, and allowing one expansion per experiment gives about half the replication's error over the learning curve. The parameter cap alone does not account for it: guided beats cap only over the curve on 5 of 6 worlds.
+5. **The designs did expose misfit, but only for the pools we had.** Under the χ² arm, 64% of designed experiments failed the check and 31% missed the MAP prediction by more than 100× the 99% noise quantile. Every one of the 454 laws in the 18 initial pools used both charges, and the pools mixed radial forms, so the shared-mistake case was never set up. These runs neither confirm nor refute that VoI gets stuck when every candidate shares a mistake.
+
+### What still fails
+
+- **No arm recovered the exact law** on yukawa, oscillator or extra-dim. Guided yukawa seed 1 ended on the textbook Yukawa, exp(−λr)/rⁿ, not the K₁ kernel; gravity and fractional end on softened 1/r and 1/r² laws that are equivalent within the noise.
+- **Oscillator's sign-reversing coupling, cos(ωt + φ)/r, was never proposed.** Guided runs tried exp(−λrt) and 1 − (t/τ)² instead.
+- **Late single proposals still blow up.** Guided ends at 8.0 on oscillator seed 1 and 31.6 on extra-dim seed 0, so its final-point ratios have wide intervals.
+
+### Protocol
+
+- **Code:** `main` at [`306acc5`](https://github.com/sunxd3/mda/commit/306acc5) plus this change; DiscoverPhysics at `33b7fa9`.
+- **Settings:** the continuous box and integrator of [ForceBench](benchmarks/forcebench.md#continuous-design-and-the-expansion-check); otherwise v4's ForceBench settings (pool 24, 6 proposals per expansion, 60 SMC particles, Occam penalty 2.5, σ = 0.05, seed drop at r = 3).
+- **Command, per cell:** `mda-reproduce physics --world WORLD --seed SEED --live --provider codex --budget 13 --design-space continuous` plus `--check chi2`, `--check guided --max-params 3`, or `--max-params 3` for the other arms.
+- **LLM:** GPT-5.6 Luna at medium effort through Codex. The initial proposal for each world and seed was generated once and replayed by all arms.
+- **Runs:** 72 of 72 completed 13 of 13, with no failed predictions and no reruns. Each takes 25–45 minutes of CPU.
+
+### Limits and next steps
+
+- Three seeds per world and one LLM draw per run. The guided arm changes the prompt and the expansion schedule together.
+- There is no DP-Agent harness here, so these runs do not measure the MDA–DP-Agent gap; our MDA differs from the writeup's (proposer prompt, optimizer implementation) in ways we cannot pin down.
+- The direct test of the shared-mistake mechanism is a fixed pool of charge-blind laws with expansion off on coulomb, and of short-range power laws on yukawa: compare VoI's maximum over the box with the largest misfit any design would reveal, against the same pool plus the true law.

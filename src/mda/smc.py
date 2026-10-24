@@ -72,6 +72,8 @@ def _evaluate_likelihoods(
     likelihood: Likelihood,
     rng: np.random.Generator,
 ) -> np.ndarray:
+    if "predict_many" in model.metadata and hasattr(likelihood, "batch"):
+        return likelihood.batch(dataset, model, particles)
     values = np.empty(len(particles), dtype=float)
     for index, theta in enumerate(particles):
         try:
@@ -201,7 +203,28 @@ def parameter_posterior(
             config.proposal_scale * spread,
             np.maximum(config.minimum_proposal_scale, prior_width * 1e-6),
         )
+        batched = "predict_many" in model.metadata and hasattr(likelihood, "batch")
         for _ in range(config.rejuvenation_steps):
+            if batched:
+                # The same independent random-walk move for every particle, scored in one batch.
+                attempted += count
+                proposals = particles + rng.normal(0.0, proposal_std, size=particles.shape)
+                proposal_priors = np.asarray([model.prior.logpdf(p) for p in proposals], dtype=float)
+                proposal_likelihoods = np.full(count, -np.inf)
+                inside = np.isfinite(proposal_priors)
+                if np.any(inside):
+                    proposal_likelihoods[inside] = _evaluate_likelihoods(
+                        dataset, model, proposals[inside], likelihood, rng)
+                with np.errstate(invalid="ignore"):
+                    log_acceptance = (beta * (proposal_likelihoods - log_likelihoods)
+                                      + proposal_priors - log_priors)
+                    accept = np.isfinite(proposal_likelihoods) & (
+                        np.log(rng.random(count)) < np.minimum(0.0, log_acceptance))
+                particles[accept] = proposals[accept]
+                log_likelihoods[accept] = proposal_likelihoods[accept]
+                log_priors[accept] = proposal_priors[accept]
+                accepted += int(accept.sum())
+                continue
             for index in range(count):
                 attempted += 1
                 proposal = particles[index] + rng.normal(0.0, proposal_std)
